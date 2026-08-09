@@ -1,0 +1,27 @@
+#!/bin/sh
+# ZENITH/OS post-install. Runs as root. We deliberately do NOT enable any system
+# service here: ZENITH must run as the DESKTOP USER (it reads that user's Claude
+# Code data and writes to their ~/.zenith). Per-user autostart is opt-in via
+# `zenith autostart`, which installs a systemd --user service as that user.
+set -e
+
+GREEN='\033[32m'; CYAN='\033[36;1m'; DIM='\033[90m'; RST='\033[0m'
+
+printf '\n'
+printf '  %bZENITH/OS%b installed.\n\n' "$CYAN" "$RST"
+printf '  Start it (as your normal user, not root):\n\n'
+printf '      %bzenith%b            %b# start the server + open in your browser%b\n\n' "$CYAN" "$RST" "$DIM" "$RST"
+printf '  Keep it running across reboots (per-user systemd service):\n\n'
+printf '      %bzenith autostart%b\n\n' "$CYAN" "$RST"
+printf '  Other commands:  zenith stop | restart | status | logs\n\n'
+printf '  %bNote:%b Claude Code (the `claude` CLI) must be installed and logged in\n' "$GREEN" "$RST"
+printf '        separately — get it at https://claude.com/claude-code\n'
+if command -v tmux >/dev/null 2>&1; then
+  printf '        tmux found — terminals will survive ZENITH restarts.\n\n'
+else
+  printf '  %btmux is NOT installed%b — without it, restarting ZENITH kills every\n' "$CYAN" "$RST"
+  printf '        open terminal and the agent sessions inside them.\n'
+  printf '        Fix it with:  %bsudo apt install -y tmux%b\n\n' "$CYAN" "$RST"
+fi
+
+exit 0

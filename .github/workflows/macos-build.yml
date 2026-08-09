@@ -1,0 +1,65 @@
+name: macos-build
+
+# Builds the macOS .dmg (Apple Silicon) and attaches it to a release. Fires when a
+# release is published, or manually with a tag. PyInstaller can't cross-compile, so
+# this runs on a real macOS (arm64) runner.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the .dmg to"
+        required: false
+        default: "v0.1.0"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14   # Apple Silicon (arm64)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build ZENITH.dmg
+        run: bash packaging/macos/build.sh
+
+      - name: Smoke test — server responds 200
+        run: |
+          hdiutil attach dist/ZENITH.dmg -nobrowse -mountpoint /Volumes/ZTEST
+          ZENITH_PORT=8799 ZENITH_NO_BROWSER=1 /Volumes/ZTEST/ZENITH.app/Contents/MacOS/ZENITH &
+          PID=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8799/api/overview"; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$PID" 2>/dev/null || true
+          hdiutil detach /Volumes/ZTEST -quiet || true
+          [ "$ok" = 1 ] || { echo "server did not respond 200"; exit 1; }
+          echo "health OK (200)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenith-macos
+          path: dist/ZENITH.dmg
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          TAG="${INPUT_TAG}"
+          [ "$EVENT_NAME" = "release" ] && TAG="${REF_NAME}"
+          if [ -z "$TAG" ]; then echo "no tag -> artifact only"; exit 0; fi
+          gh release upload "$TAG" dist/ZENITH.dmg --clobber --repo "$REPO"
+          echo "attached to $TAG"

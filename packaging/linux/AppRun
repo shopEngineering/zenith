@@ -1,0 +1,7 @@
+#!/bin/bash
+# AppImage entry point. Runs the bundled PyInstaller onedir binary. The binary is
+# fully self-contained (Python + stdlib + static/ inside); server.py's frozen-mode
+# logic writes runtime state to ~/.zenith. Any args (e.g. --appimage-* handled by
+# the runtime before we get here) are forwarded.
+HERE="$(dirname "$(readlink -f "${0}")")"
+exec "${HERE}/usr/bin/zenith/zenith" "$@"

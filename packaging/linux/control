@@ -1,0 +1,18 @@
+Package: zenith-os
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.9)
+Recommends: tmux
+Maintainer: ZENITH/OS <zenith@localhost>
+Homepage: https://github.com/shopEngineering/zenith
+Description: ZENITH/OS — local control room for Claude Code
+ A zero-dependency Python stdlib web app that serves a browser dashboard over
+ your real on-disk Claude Code data: session transcripts, projects, docs,
+ memories, coordination state, and a headless job runner. Runs entirely on
+ localhost. Uses the system python3 (no bundled interpreter).
+ .
+ After install, run `zenith` to start the server and open it in your browser,
+ or `zenith autostart` to keep it running as a per-user systemd service.
+ Claude Code (the `claude` CLI) must be installed and logged in separately.

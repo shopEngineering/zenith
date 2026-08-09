@@ -1,0 +1,190 @@
+[
+  {
+    "id": "claude",
+    "label": "Claude Code",
+    "enabled": true,
+    "bin": "claude",
+    "bin_probe": [
+      "~/.local/bin/claude",
+      "~/.claude/local/claude",
+      "~/bin/claude",
+      "/opt/homebrew/bin/claude",
+      "/usr/local/bin/claude",
+      "/usr/bin/claude"
+    ],
+    "exec_subcommand": null,
+    "argv": [
+      "-p",
+      "{prompt}",
+      "--model",
+      "{model}",
+      "--output-format",
+      "json",
+      "{mode_flags}"
+    ],
+    "budget_flag": "--max-budget-usd",
+    "add_dir_flag": "--add-dir",
+    "models": {
+      "kind": "static",
+      "list": [
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-haiku-4-5-20251001"
+      ]
+    },
+    "models_comment": "The Claude CLI has no models endpoint, so this list is shipped, not detected. Edit data/agents.json to pin or add ids.",
+    "mode_flags": {
+      "default": [],
+      "acceptEdits": [
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "bypassPermissions": [
+        "--dangerously-skip-permissions"
+      ]
+    },
+    "env": {},
+    "cost_format": "claude_json_array",
+    "transcript": {
+      "glob": "~/.claude/projects/*/*.jsonl",
+      "format": "claude_jsonl",
+      "pick": "newest"
+    },
+    "auth": "external",
+    "capabilities": {
+      "json_output": true,
+      "cost": true,
+      "transcript": true
+    },
+    "reviewer_ok": true
+  },
+  {
+    "id": "codex",
+    "label": "Codex CLI",
+    "enabled": false,
+    "bin": "codex",
+    "bin_probe": [
+      "~/.local/bin/codex",
+      "~/bin/codex",
+      "/opt/homebrew/bin/codex",
+      "/usr/local/bin/codex",
+      "/usr/bin/codex",
+      "/Applications/Codex.app/Contents/Resources/codex"
+    ],
+    "exec_subcommand": "exec",
+    "argv": [
+      "{prompt}",
+      "-m",
+      "{model}",
+      "--json",
+      "--output-last-message",
+      "{last_msg_file}",
+      "-C",
+      "{cwd}",
+      "--skip-git-repo-check",
+      "{mode_flags}"
+    ],
+    "budget_flag": null,
+    "add_dir_flag": null,
+    "models": {
+      "kind": "suggest",
+      "list": [
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra"
+      ]
+    },
+    "models_comment": "kind=suggest: these ids were valid on codex-cli 0.144.0-alpha.4 but the CLI exposes no models endpoint, so they are shown as suggestions and never asserted present. An unsupported id returns HTTP 400 from codex.",
+    "mode_flags": {
+      "default": [
+        "--sandbox",
+        "read-only"
+      ],
+      "acceptEdits": [
+        "--sandbox",
+        "workspace-write"
+      ],
+      "bypassPermissions": [
+        "--dangerously-bypass-approvals-and-sandbox"
+      ]
+    },
+    "env": {},
+    "cost_format": "codex_json",
+    "transcript": {
+      "glob": "~/.codex/sessions/**/*.jsonl",
+      "format": "codex_json",
+      "pick": "newest"
+    },
+    "auth": "external",
+    "capabilities": {
+      "json_output": true,
+      "cost": false,
+      "transcript": true
+    },
+    "reviewer_ok": true
+  },
+  {
+    "id": "aider",
+    "label": "aider",
+    "enabled": false,
+    "bin": "aider",
+    "bin_probe": [
+      "~/.local/bin/aider",
+      "~/bin/aider",
+      "~/Library/Python/*/bin/aider",
+      "~/.pyenv/shims/aider",
+      "/opt/homebrew/bin/aider",
+      "/usr/local/bin/aider",
+      "/usr/bin/aider"
+    ],
+    "bin_probe_comment": "Hints only — PATH (shutil.which) is tried first. '*' matches one path component, so ~/Library/Python/*/bin/aider finds any pip --user install without pinning a Python minor version.",
+    "exec_subcommand": null,
+    "argv": [
+      "--message",
+      "{prompt}",
+      "--model",
+      "{model}",
+      "{mode_flags}"
+    ],
+    "budget_flag": null,
+    "add_dir_flag": null,
+    "models": {
+      "kind": "detect",
+      "source": "ollama_tags",
+      "fallback": []
+    },
+    "models_comment": "kind=detect: aider's model list is whatever the local Ollama actually has pulled, so it is probed at runtime (GET {base}/api/tags) rather than shipped. fallback=[] because no tag exists on a fresh machine.",
+    "mode_flags": {
+      "default": [],
+      "acceptEdits": [
+        "--yes-always",
+        "--no-auto-commits"
+      ],
+      "bypassPermissions": [
+        "--yes-always",
+        "--no-auto-commits"
+      ]
+    },
+    "env": {
+      "OLLAMA_API_BASE": "http://127.0.0.1:11434"
+    },
+    "env_comment": "Loopback default. To use a remote or non-default Ollama, edit OLLAMA_API_BASE in data/agents.json (machine state) — not here in defaults/.",
+    "cost_format": "aider_summary",
+    "transcript": {
+      "glob": "{cwd}/.aider.chat.history.md",
+      "format": "aider_md",
+      "pick": "path"
+    },
+    "auth": "external",
+    "capabilities": {
+      "json_output": false,
+      "cost": true,
+      "transcript": true
+    },
+    "reviewer_ok": false
+  }
+]

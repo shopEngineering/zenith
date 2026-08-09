@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "note": "Shipped model policy tables. TRACKED in git, never written at runtime. data/models.json (gitignored, absent by default) deep-merges OVER this file, and the existing config.json overrides still win where they exist (context.windows). server.py keeps an identical built-in fallback so a missing/corrupt file never stops a boot.",
+  "aliases": {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-5",
+    "opus": "claude-opus-4-8",
+    "fable": "claude-fable-5"
+  },
+  "effort_tokens": {
+    "low": 2048,
+    "medium": 8192,
+    "high": 31999
+  },
+  "verify_ladder": {
+    "haiku": "sonnet",
+    "sonnet": "opus",
+    "opus": "fable",
+    "fable": "fable"
+  },
+  "context_windows": {
+    "claude-opus-5": 1000000,
+    "claude-fable-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-opus-4": 200000,
+    "claude-sonnet-4": 200000,
+    "claude-haiku-4": 200000,
+    "claude-3": 200000,
+    "gpt-5": 400000,
+    "o3": 200000
+  },
+  "context_window_fallback": 200000
+}

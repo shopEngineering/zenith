@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ZENITH/OS
+Comment=Local control room for Claude Code
+Exec=zenith
+Icon=zenith
+Categories=Development;Utility;
+Terminal=false

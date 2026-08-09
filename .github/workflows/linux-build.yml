@@ -1,0 +1,91 @@
+name: linux-build
+
+# Builds the Linux .deb + AppImages (x86_64 + aarch64) and attaches them to a
+# release. Fires when a release is published, or manually with a tag. The
+# AppImage build runs as a matrix across native x86_64 and arm64 Ubuntu
+# runners (no Docker/QEMU needed — both runners are natively Linux). The .deb
+# is arch-independent (all/noarch payload) and only built once, on x86_64.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the artifacts to"
+        required: false
+        default: "v0.1.0"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            build_deb: true
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            build_deb: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging deps
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev binutils squashfs-tools file wget ca-certificates python3-venv
+
+      - name: Build .deb
+        if: matrix.build_deb
+        run: bash packaging/linux/build-deb.sh
+
+      - name: Build AppImage (${{ matrix.arch }})
+        run: bash packaging/linux/build-appimage.sh
+
+      - name: Smoke test — AppImage serves 200 (no system Python)
+        run: |
+          ZENITH_PORT=8799 ZENITH_NO_BROWSER=1 ./dist/ZENITH-${{ matrix.arch }}.AppImage --appimage-extract-and-run &
+          PID=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:8799/api/overview"; then ok=1; break; fi
+            sleep 1
+          done
+          kill "$PID" 2>/dev/null || true
+          [ "$ok" = 1 ] || { echo "AppImage server did not respond 200"; exit 1; }
+          echo "health OK (200)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenith-linux-${{ matrix.arch }}
+          path: |
+            dist/zenith-os_*_all.deb
+            dist/ZENITH-${{ matrix.arch }}.AppImage
+          if-no-files-found: ignore
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+          BUILD_DEB: ${{ matrix.build_deb }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          TAG="${INPUT_TAG}"
+          [ "$EVENT_NAME" = "release" ] && TAG="${REF_NAME}"
+          if [ -z "$TAG" ]; then echo "no tag -> artifacts only"; exit 0; fi
+          ASSETS="dist/ZENITH-${ARCH}.AppImage"
+          if [ "$BUILD_DEB" = "true" ]; then
+            ver="$(tr -d '[:space:]' < VERSION)"
+            ASSETS="dist/zenith-os_${ver}_all.deb ${ASSETS}"
+          fi
+          gh release upload "$TAG" $ASSETS --clobber --repo "$REPO"
+          echo "attached to $TAG"
