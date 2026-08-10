@@ -1086,7 +1086,10 @@ const WM = {
     this.refreshSwitcher();
     this.closeExpose();
     const top = this.visibleWins().sort((a, b) => (+b.el.style.zIndex || 0) - (+a.el.style.zIndex || 0))[0];
-    if (top) this.focus(top); else this.focusedWin = null;
+    // an EMPTY target desktop must still drop the focus ring from the window we left,
+    // or it stays "focused" while invisible and every focus-conditional path misreads it
+    if (top) this.focus(top);
+    else { for (const w of this.wins.values()) w.el.classList.remove('focus'); this.focusedWin = null; }
     this.persistLayout();
   },
   stepDesktop(dir) {
@@ -1217,7 +1220,13 @@ const Dock = {
       b.onclick = () => {
         if (app.drawer) { Drawer.toggle(app); return; }
         const w = WM.wins.get(app.id);
-        if (w && !w.min && w.el.classList.contains('focus')) WM.minimize(w);
+        // click-to-minimize applies ONLY to a window that is actually in front of you on
+        // THIS desktop. A window living on another desktop keeps its stale .focus class
+        // (switchDesktop only reassigns focus when the target desktop has a window), so
+        // the old check minimized it instead of pulling it over — the icon looked like a
+        // no-op and a running window "vanished". Elsewhere → always open (= bring here).
+        const here = w && (w.desktop || 1) === WM.activeDesktop;
+        if (w && !w.min && here && w.el.classList.contains('focus')) WM.minimize(w);
         else WM.open(app.id);
       };
       d.appendChild(b);
@@ -2315,13 +2324,17 @@ function trackRecentProject(cwd, mode) {
 function defaultEffort() { return localStorage.getItem('zen.effort') || 'high'; }
 // persist defaults ON (tmux, survives restarts) unless the caller passes an explicit boolean
 function defaultPersist() { return localStorage.getItem('zen.persist') !== '0'; }
-async function launchTerm(cwd, mode, persist, effort) {
+// `worktree` is the prime-agent mode's remote work dir on the GPU box; ignored by every
+// other mode, and the server re-validates it (it lands in a remote shell command).
+async function launchTerm(cwd, mode, persist, effort, worktree) {
   if (cwd) { localStorage.setItem('zen.lastcwd', cwd); trackRecentProject(cwd, mode); }
   const eff = effort || defaultEffort();
   const p = (persist === undefined) ? defaultPersist() : !!persist;
+  const body = { cwd: cwd || null, mode: mode || 'shell', persist: p, effort: eff };
+  if (worktree) body.worktree = worktree;
   const r = await apiSafe('/api/term', { method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cwd: cwd || null, mode: mode || 'shell', persist: p, effort: eff }) });
+    body: JSON.stringify(body) });
   if (r) openTermWindow(r.term);
   return r;
 }

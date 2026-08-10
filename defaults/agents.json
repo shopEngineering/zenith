@@ -186,5 +186,52 @@
       "transcript": true
     },
     "reviewer_ok": false
+  },
+  {
+    "id": "prime-agent",
+    "label": "prime-agent (remote)",
+    "enabled": false,
+    "bin": "pa-job.sh",
+    "bin_probe": [],
+    "label_comment": "Generic on purpose: the shipped seed must not name anyone's machine. Rename it in data/agents.json (machine state) to whatever that box is actually called.",
+    "bin_probe_comment": "No hints needed: the server puts its own bin/ on PATH at import, so the shipped wrapper resolves by bare name wherever ZENITH is installed.",
+    "exec_subcommand": null,
+    "argv": [
+      "{prompt}",
+      "{mode_flags}"
+    ],
+    "argv_comment": "The whole agent runs on another machine, inside a container. bin/pa-job.sh takes the prompt as ONE ordinary argv element and base64-encodes it before it reaches a remote shell, so no prompt can become syntax over there. {model} is deliberately absent: the container's own config selects the model.",
+    "budget_flag": null,
+    "add_dir_flag": null,
+    "models": {
+      "kind": "suggest",
+      "list": [
+        "qwen3.6-35b"
+      ]
+    },
+    "models_comment": "kind=suggest: the model is whatever the remote container is configured with, and ZENITH cannot probe inside it — so this labels the arm and asserts nothing. Changing it does not change the run.",
+    "mode_flags": {
+      "default": [],
+      "acceptEdits": [
+        "--autonomous"
+      ],
+      "bypassPermissions": [
+        "--autonomous"
+      ]
+    },
+    "mode_flags_comment": "The container IS the sandbox (non-root, cap-drop ALL, egress-locked, no home mount), so ZENITH's permission modes have no filesystem to gate. They select EFFORT instead: default = one shot, prompt in / answer out; the other two add --autonomous, which keeps working past the first reply until the run's own limits stop it.",
+    "env": {},
+    "cost_format": "prime_agent_jsonl",
+    "transcript": null,
+    "transcript_comment": "The run is stateless by design (--no-session): the JSONL event stream on stdout IS the record, and it lands in the job's console and job.end payload. Nothing to glob for.",
+    "auth": "external",
+    "capabilities": {
+      "json_output": true,
+      "cost": true,
+      "transcript": false
+    },
+    "reviewer_ok": false,
+    "requires": "A reachable prime-agent host. Configure it in data/pa.json ({host, job, worktree_root}) or ZENITH_PA_HOST — never in source, which ships publicly.",
+    "notes": "Remote-only agent: nothing runs on this machine but an ssh. Enable in data/agents.json once data/pa.json points at a box."
   }
 ]

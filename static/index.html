@@ -697,6 +697,20 @@ table.tbl td{padding:7px 10px;border-bottom:1px solid color-mix(in srgb,var(--ac
 .mod-tab.on{color:var(--acc);border-bottom-color:var(--acc)}
 .mod-stack{flex:1;min-height:0;position:relative;display:flex;flex-direction:column}
 .mod-pane{flex:1;min-height:0;overflow:auto;position:relative;display:flex;flex-direction:column}
+/* module windows (Docs/Studio/Run/Lab/Activity, tagged .mod-win via moduleApp()'s cls):
+   make win-body a real flex column so .mod-stack/.mod-pane's flex:1 actually propagates
+   height instead of the pane just hugging its content and the whole win-body scrolling
+   as one lump. Scoped to .mod-win only — every other window keeps win-body's plain
+   overflow:auto scroll behavior untouched. */
+.mod-win .win-body{display:flex;flex-direction:column;overflow:hidden}
+/* Ops "builder" launch pane: prompt + LAUNCH/SAVE stay pinned to the bottom of the
+   window so a streaming console can't push them off-screen; everything else scrolls
+   in the region above. Only engages inside .mod-pane once .mod-win makes the height
+   chain above it real (see .mod-win .win-body). */
+.ops-shell{flex:1;min-height:0;display:flex;flex-direction:column}
+.ops-scroll{flex:1;min-height:0;overflow-y:auto;padding:14px 16px}
+.ops-composer{flex:none;padding:10px 16px 14px;border-top:1px solid var(--line);
+  background:color-mix(in srgb,var(--bg1) 92%,transparent)}
 /* stat tiles */
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:14px}
 .tile{background:color-mix(in srgb,var(--acc) 3%,transparent);border:1px solid var(--line);border-radius:var(--radius);padding:13px 15px;
@@ -788,9 +802,12 @@ table.tbl td{padding:7px 10px;border-bottom:1px solid color-mix(in srgb,var(--ac
 .det pre{white-space:pre-wrap;word-break:break-word;color:var(--dim);font-size:11px;margin:4px 0}
 
 /* console */
+/* The console scrolls INSIDE itself. A fixed 340px block in normal flow pushed the
+   launch controls below the fold on a small window during a long run; capping against
+   the viewport keeps the form reachable no matter how much output arrives. */
 .console{background:#02070b;border:1px solid var(--line);border-radius:8px;padding:11px 13px;
   font-size:11.5px;line-height:1.65;color:#9fd8c8;white-space:pre-wrap;word-break:break-word;
-  max-height:340px;overflow-y:auto;user-select:text}
+  max-height:min(340px,38vh);overflow-y:auto;overscroll-behavior:contain;user-select:text}
 
 /* markdown */
 .md{user-select:text;line-height:1.7;font-size:12.5px;max-width:860px}
@@ -942,6 +959,26 @@ table.tbl td{padding:7px 10px;border-bottom:1px solid color-mix(in srgb,var(--ac
 .wizard .wizrow{display:flex;align-items:center;gap:10px;margin:7px 0}
 .wizard .wizrow label{flex:none;width:108px;color:var(--dim);font-size:11.5px}
 .wizard .wizrow input{flex:1;min-width:0}
+/* wizard step 3 — AI runtimes. The confirmed/suggested split is the point: a solid green
+   model chip was seen by a live probe, a dashed grey one is only a suggestion. */
+.wizard .wizrt-h{display:flex;align-items:center;gap:8px;font:600 10px var(--disp);letter-spacing:.2em;
+  text-transform:uppercase;color:var(--dim);margin:14px 0 2px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.wizard .wizrt-h .sp{flex:1}
+.wizard .wizrt-agents .introw,.wizard .wizrt-eps .introw{align-items:flex-start}
+.wizard .wizrt-agents .idot,.wizard .wizrt-eps .idot,.wizard .wizrt-agents .tgl,.wizard .wizrt-eps .tgl{margin-top:3px}
+.wizard .wiz-detrow.wizoff{opacity:.5}
+.wizard .wiz-detrow .d{overflow-wrap:anywhere}
+.wizard .wizmods{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.wizard .mchip{font-size:10px;letter-spacing:.03em;border-radius:5px;padding:1px 6px;
+  color:var(--green);border:1px solid rgba(78,240,166,.35);background:rgba(78,240,166,.06)}
+.wizard .mchip.sug,.wizard .mchip.more{color:var(--faint);border-color:var(--line);background:transparent}
+.wizard .mchip.sug{border-style:dashed}
+.wizard .wizleg{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:9px;font-size:10.5px;color:var(--faint)}
+.wizard .wizrt-add{border:1px solid var(--line);border-radius:9px;padding:9px 12px 11px;margin-top:4px;
+  background:color-mix(in srgb,var(--acc) 2%,transparent)}
+.wizard .wizrt-add .d{color:var(--dim);font-size:11.5px;line-height:1.45}
+.wizard .wizrt-add select{flex:1;min-width:0}
+.wizard .wizrt-tres{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:7px;font-size:11px;color:var(--dim)}
 .wizard .modgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px}
 .wizard .modgrid .mod{display:flex;align-items:center;gap:8px;padding:6px 9px;border:1px solid var(--line);border-radius:8px;background:color-mix(in srgb,var(--acc) 2%,transparent)}
 .wizard .modgrid .mod .mn{flex:1;font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

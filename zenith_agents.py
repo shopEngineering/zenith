@@ -581,10 +581,91 @@ def _cost_aider_summary(stdout, stderr, extra):
             "raw": {"source": "aider_summary", "tok_in": tin, "tok_out": tout}}
 
 
+def _int0(v):
+    """int(v) or 0 — usage arithmetic must never raise on a drifted field."""
+    try:
+        return int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cost_prime_agent_jsonl(stdout, stderr, extra):
+    """`prime-agent --mode json` JSONL event stream → normalized usage.
+    VERIFIED AT BUILD against prime-agent 0.7.1 in the remote container.
+
+    The deliverable is the LAST assistant text. That matters here in a way it
+    does not for the one-shot CLIs: an autonomous run keeps working past its
+    first reply, so the final message — not the first — is the one that
+    reflects everything the run actually did.
+
+    Usage is SUMMED across assistant message_end events, because each carries
+    the final counts for its own message rather than a running total; it lives
+    at message.usage as {input, output, cacheRead, cacheWrite, cost:{total}}.
+    On a self-hosted model that cost is 0.0, and 0.0 is a fact worth booking
+    (the run was free) rather than a None (unknown). tool_execution_end events
+    are counted so a run's tool activity survives into job.end.
+
+    Tolerant by construction: unparsable lines are skipped, a stream truncated
+    by the 2 MB stdout cap still yields whatever its tail held, and a stream
+    with nothing recognizable returns None so _job_finished falls back to
+    dumping the raw text verbatim."""
+    result, session_id, model = "", None, None
+    tin = tout = cache_r = cache_w = tools = messages = 0
+    cost = 0.0
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        kind = obj.get("type")
+        if kind == "session":
+            session_id = session_id or obj.get("id")
+            continue
+        if kind == "tool_execution_end":
+            tools += 1
+            continue
+        if kind != "message_end":      # turn_end repeats the same message dict
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        messages += 1
+        model = msg.get("model") or model
+        u = msg.get("usage")
+        if isinstance(u, dict):
+            tin += _int0(u.get("input"))
+            tout += _int0(u.get("output"))
+            cache_r += _int0(u.get("cacheRead"))
+            cache_w += _int0(u.get("cacheWrite"))
+            c = u.get("cost")
+            if isinstance(c, dict):
+                try:
+                    cost += float(c.get("total") or 0)
+                except (TypeError, ValueError):
+                    pass
+        text = "".join(str(p.get("text") or "")
+                       for p in (msg.get("content") or [])
+                       if isinstance(p, dict) and p.get("type") == "text").strip()
+        if text:
+            result = text
+    if not (result or tin or tout or tools):
+        return None
+    return {"result": result,
+            "usage": {"in": tin, "out": tout,
+                      "cache_r": cache_r, "cache_w": cache_w},
+            "cost_usd": round(cost, 6), "session_id": session_id,
+            "raw": {"source": "prime_agent_jsonl", "tools": tools,
+                    "messages": messages, "model": model}}
+
+
 COST_PARSERS = {
     "claude_json_array": _cost_claude_json_array,
     "codex_json": _cost_codex_json,
     "aider_summary": _cost_aider_summary,
+    "prime_agent_jsonl": _cost_prime_agent_jsonl,
     "none": _cost_none,
 }
 
@@ -827,13 +908,21 @@ def _selftest():
     # -- seeds + manifest loading (no file bound: seeds only) --
     AGENTS_FILE = None
     ags = load_agents()
-    assert [a["id"] for a in ags] == ["claude", "codex", "aider"], [a["id"] for a in ags]
-    assert ags[0]["enabled"] is True and ags[1]["enabled"] is False and ags[2]["enabled"] is False
+    assert [a["id"] for a in ags] == ["claude", "codex", "aider", "prime-agent"], \
+        [a["id"] for a in ags]
+    assert ags[0]["enabled"] is True and not any(a["enabled"] for a in ags[1:]), \
+        "only claude ships enabled — the rest need install/config first"
 
     # -- no machine-specific junk in what we SHIP (a stranger's clone gets this) --
     blob = json.dumps(seed_agents())
-    for bad in ("/Users/", "/home/", "192.168.", "10.0.", ".local:", "tailscale"):
+    # "@" catches the shape a leaked endpoint actually takes (user@host); the
+    # repo-wide hostname sweep lives in publish.sh, which greps every shipped
+    # file rather than only this one.
+    for bad in ("/Users/", "/home/", "192.168.", "10.0.", ".local:", "tailscale", "@"):
         assert bad not in blob, "shipped defaults leak machine state: " + bad
+    # A remote agent is the one kind that CAN carry an address, so say out loud
+    # that it does not: its endpoint lives in data/pa.json, which never ships.
+    assert not any("host" in a for a in seed_agents()), "no endpoint in the seed"
     for a in seed_agents():                              # hints stay relative/standard
         for hint in a.get("bin_probe") or []:
             assert hint.startswith(("~", "/opt/", "/usr/", "/Applications/")), hint
@@ -847,13 +936,13 @@ def _selftest():
     assert os.path.exists(snap_file), "first boot writes the seed snapshot"
     with open(AGENTS_FILE) as f:
         ondisk = json.load(f)
-    assert [a["id"] for a in ondisk] == ["claude", "codex", "aider"]
+    assert [a["id"] for a in ondisk] == ["claude", "codex", "aider", "prime-agent"]
     # snapshot is an OBJECT keyed by section (shared with providers), and our
     # writer must never stomp a section it does not own.
     with open(snap_file) as f:
         snap = json.load(f)
     assert isinstance(snap, dict) and [a["id"] for a in snap["agents"]] == \
-        ["claude", "codex", "aider"], snap
+        ["claude", "codex", "aider", "prime-agent"], snap
     snap["providers"] = [{"id": "ollama", "host": "127.0.0.1"}]
     with open(snap_file, "w") as f:
         json.dump(snap, f)
@@ -867,7 +956,8 @@ def _selftest():
         json.dump([a for a in ondisk if a["id"] == "claude"], f)
     with open(snap_file, "w") as f:
         json.dump({"agents": [a for a in ondisk if a["id"] == "claude"]}, f)
-    assert {a["id"] for a in load_agents()} == {"claude", "codex", "aider"}, "seed-merge"
+    assert {a["id"] for a in load_agents()} == {"claude", "codex", "aider",
+                                                "prime-agent"}, "seed-merge"
     # an id the user DELETED (present in the snapshot, absent from their file)
     # stays deleted — absence is a choice, not a gap.
     with open(AGENTS_FILE, "w") as f:
@@ -877,7 +967,8 @@ def _selftest():
     assert {a["id"] for a in load_agents()} == {"claude"}, "deleted id not resurrected"
     with open(AGENTS_FILE, "w") as f:
         f.write("NOT JSON")
-    assert [a["id"] for a in load_agents()] == ["claude", "codex", "aider"], "corrupt → seeds"
+    assert [a["id"] for a in load_agents()] == ["claude", "codex", "aider",
+                                                "prime-agent"], "corrupt → seeds"
     with open(AGENTS_FILE) as f:                         # corrupt file is NOT clobbered
         assert f.read() == "NOT JSON", "corrupt file left untouched"
     AGENTS_FILE = None
@@ -1154,6 +1245,57 @@ def _selftest():
     assert rp["usage"]["in"] == 735 and rp["usage"]["out"] == 1, rp["usage"]
     assert rp["cost_usd"] is None, "Ollama = no cost clause -> None (verified)"
     assert rp["result"].startswith("Aider"), "whole stdout -> console (D1)"
+
+    # -- prime_agent_jsonl cost parser (VERIFIED AT BUILD, prime-agent 0.7.1) --
+    # Fixture is the real shape the container emitted for "compute 6*7":
+    # a session header, two assistant message_end events (thinking + text, the
+    # first also carrying a toolCall), one tool_execution_end, and the turn_end
+    # that REPEATS the last message — the repeat must not double-count usage.
+    def _me(text, tin, tout, extra=None):
+        content = [{"type": "thinking", "thinking": "…"},
+                   {"type": "text", "text": text}] + list(extra or [])
+        return {"type": "message_end", "message": {
+            "role": "assistant", "model": "qwen3.6-35b", "content": content,
+            "usage": {"input": tin, "output": tout, "cacheRead": 0,
+                      "cacheWrite": 0, "totalTokens": tin + tout,
+                      "cost": {"total": 0}}}}
+    pa_lines = "\n".join(json.dumps(o) for o in [
+        {"type": "session", "id": "019fe919-0000-7739-8103-5dbd0b39c82f"},
+        {"type": "agent_start"},
+        {"type": "message_end", "message": {"role": "user", "content": [
+            {"type": "text", "text": "compute 6*7"}]}},
+        _me("Let me compute that.", 2293, 54,
+            [{"type": "toolCall", "toolName": "ipython"}]),
+        {"type": "tool_execution_end", "toolName": "ipython",
+         "result": {"content": [{"type": "text", "text": "42\n"}]}},
+        _me("42", 2341, 52),
+        {"type": "turn_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "42"}], "usage": {"input": 2341,
+                                                       "output": 52}}},
+        {"type": "agent_end"}])
+    pp = COST_PARSERS["prime_agent_jsonl"](pa_lines, "", {})
+    assert pp["result"] == "42", "the LAST assistant text is the deliverable"
+    assert pp["usage"]["in"] == 4634 and pp["usage"]["out"] == 106, pp["usage"]
+    assert pp["raw"]["tools"] == 1 and pp["raw"]["messages"] == 2, pp["raw"]
+    assert pp["raw"]["model"] == "qwen3.6-35b"
+    assert pp["cost_usd"] == 0.0, "self-hosted = free, and free is not unknown"
+    assert pp["session_id"].startswith("019fe919"), pp["session_id"]
+    # a stream truncated mid-run still yields the tail it did see
+    assert COST_PARSERS["prime_agent_jsonl"](
+        "…stdout truncated…\n" + json.dumps(_me("partial", 10, 2)),
+        "", {})["result"] == "partial"
+    # nothing recognizable -> None, so _job_finished dumps raw stdout verbatim
+    assert COST_PARSERS["prime_agent_jsonl"]("not json at all", "", {}) is None
+    assert COST_PARSERS["prime_agent_jsonl"]("", "", {}) is None
+    assert COST_PARSERS["prime_agent_jsonl"](
+        json.dumps({"type": "session", "id": "x"}), "", {}) is None, \
+        "a session header alone is not a run"
+    # a garbage usage block must not raise, and must not poison the result
+    assert COST_PARSERS["prime_agent_jsonl"](json.dumps(
+        {"type": "message_end", "message": {"role": "assistant",
+         "content": [{"type": "text", "text": "ok"}],
+         "usage": {"input": "?", "cost": "nope"}}}), "", {}
+        )["usage"]["in"] == 0
 
     # -- aider_md transcript parser (A5; VERIFIED AT BUILD, aider 0.86.2) --
     # Fixture mirrors the REAL .aider.chat.history.md: '# aider chat started

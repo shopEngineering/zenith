@@ -81,7 +81,7 @@ function mkWideModal(title, accent) {
    the wizard never reappears, then closes — nothing can trap the user). Called
    from boot() when Caps.data.first_run===true, and re-runnable on demand from the
    Settings › Integrations "RUN SETUP AGAIN" button (writes nothing until Finish).
-   Steps: 1 detect · 2 configure the gaps (per-card TEST) · 3 personalize modules.
+   Steps: 1 detect · 2 configure the gaps (per-card TEST) · 3 AI runtimes · 4 personalize modules.
    Field set is replicated from the §6 panel (deliberately not shared — the phase-4
    panel stays untouched). Fails soft: config/caps fetch errors degrade to empty
    defaults, never block. */
@@ -119,7 +119,7 @@ function openSetupWizard() {
   panel.innerHTML = `
     <div class="wiz-head">
       <div class="wiz-title">ZENITH · First-run setup</div>
-      <div class="wiz-steps"><span class="s" data-s="1"></span><span class="s" data-s="2"></span><span class="s" data-s="3"></span></div>
+      <div class="wiz-steps"><span class="s" data-s="1"></span><span class="s" data-s="2"></span><span class="s" data-s="3"></span><span class="s" data-s="4"></span></div>
       <button class="btn ghost sm wiz-x" data-a="close" title="Close">✕</button>
     </div>
     <div class="wiz-body"></div>
@@ -138,7 +138,8 @@ function openSetupWizard() {
   const btnSkip = panel.querySelector('[data-a=skip]');
   const btnNext = panel.querySelector('[data-a=next]');
   const step1 = el('div', 'wizstep'); const step2 = el('div', 'wizstep'); const step3 = el('div', 'wizstep');
-  body.append(step1, step2, step3);
+  const stepRT = el('div', 'wizstep');                 // AI runtimes — sits between 2 and 3
+  body.append(step1, step2, stepRT, step3);
 
   let step = 1, built2 = false, closed = false, dismissing = false;
   let cfg = null;        // GET /api/config → values + env_overrides + token_set
@@ -181,6 +182,7 @@ function openSetupWizard() {
     if (!Object.keys(patch.modules).length) delete patch.modules;
     const r = await jpost('/api/config', patch);
     if (r && r.ok) Caps.apply(r.capabilities);
+    await saveRuntimes();                                           // step 3: agents.json + providers.json
     close();                                                        // desktop already booted behind us
   };
 
@@ -287,23 +289,211 @@ function openSetupWizard() {
     step3.appendChild(grid);
   };
 
+  /* ---- Step 3: AI runtimes (§4 of the config-externalisation design) --------
+     REPORTED, never asserted. A binary we could not run reads "not found"; a model
+     id we have not seen from a live probe renders as a visibly-different suggestion
+     — the same confirmed/suggested split za.resolve_models() makes server-side.
+     Nothing is installed and no command is run from here: the step only records
+     choices, written on Finish like the rest of the wizard (so Skip/✕/Escape still
+     change nothing, and re-running it is safe). GET /api/detect is fired at open and
+     never awaited by the wiring — the step paints a probing row until it lands. */
+  const RT_HINTS = {                                   // keyed on the provider KIND, not a product
+    ollama: 'nothing answering here — brew install ollama (or https://ollama.com/download), then: ollama serve',
+    openai: 'nothing answering /v1/models here — LM Studio, vLLM, llama.cpp --server and LiteLLM all serve it',
+  };
+  const RT_CHIPS = 6;                                  // model chips per row before "+N"
+  let rtDet = null, agentDefs = null, builtRT = false, rtErr = false;
+  const rtPick = { ag: {}, ep: {} };                   // id -> the user's explicit choice
+  const pickAg = a => (a.id in rtPick.ag ? rtPick.ag[a.id] : !!a.present);
+  // a saved endpoint defaults ON even when it did not answer: a failed probe is not
+  // a reason to silently switch off a provider the user already configured.
+  const pickEp = e => (e.id in rtPick.ep ? rtPick.ep[e.id] : !!(e.alive || e.origin === 'saved'));
+  // Mirror of za.resolve_models(): static → asserted, suggest → never asserted,
+  // detect → what the probe actually returned, else the fallback as suggestions.
+  const rtModels = ag => {
+    const m = (ag && ag.models) || {};
+    if (typeof m !== 'object') return [];
+    const kind = String(m.kind || 'static');
+    if (kind === 'detect') {
+      const got = ((rtDet && rtDet.models) || {})[String(m.source || '')] || [];
+      return got.length ? got.map(x => ({ id: String(x), ok: true, src: 'probe' }))
+        : (m.fallback || []).map(x => ({ id: String(x), ok: false, src: 'suggest' }));
+    }
+    return (m.list || []).map(String).filter(Boolean)
+      .map(x => ({ id: x, ok: kind !== 'suggest', src: kind === 'suggest' ? 'suggest' : 'static' }));
+  };
+  // The tooltip stays honest about WHY a chip is confirmed: a static list is shipped
+  // with the manifest (a CLI with no models endpoint), it is not something we saw.
+  const RT_WHY = { probe: 'seen on this machine — live probe',
+    static: 'shipped with this agent — the CLI has no models endpoint to probe',
+    suggest: 'suggested — never verified on this machine' };
+  const rtChips = mods => (!mods.length ? '' : '<div class="wizmods">'
+    + mods.slice(0, RT_CHIPS).map(m => `<span class="mchip${m.ok ? '' : ' sug'}"
+      title="${RT_WHY[m.src] || RT_WHY.suggest}">${esc(m.id)}</span>`).join('')
+    + (mods.length > RT_CHIPS ? `<span class="mchip more">+${mods.length - RT_CHIPS}</span>` : '') + '</div>');
+  const rtFields = () => {
+    const g = k => { const i = stepRT.querySelector(`[data-rf="${k}"]`); return i ? String(i.value || '').trim() : ''; };
+    return { name: g('name'), base_url: g('base_url').replace(/\/+$/, ''), type: g('type') || 'ollama' };
+  };
+
+  const paintRT = () => {
+    if (!builtRT) return;
+    const agBox = stepRT.querySelector('.wizrt-agents');
+    const epBox = stepRT.querySelector('.wizrt-eps');
+    if (!rtDet) {                                      // probing (or the probe failed) — never blocks
+      agBox.innerHTML = `<div class="introw wiz-detrow"><span class="idot hollow${rtErr ? '' : ' pulse'}"></span>
+        <div class="grow"><div class="d">${rtErr ? 'detection unavailable — you can still add an endpoint below'
+        : 'probing binaries and loopback ports…'}</div></div></div>`;
+      epBox.innerHTML = '';
+      return;
+    }
+    const defs = {};
+    (agentDefs || []).forEach(a => { if (a && a.id) defs[a.id] = a; });
+    agBox.innerHTML = (rtDet.agents || []).map(a => `<div class="introw wiz-detrow${a.present ? '' : ' wizoff'}">
+      <span class="idot ${a.present ? 'green' : 'grey'}"></span>
+      <div class="grow"><div class="t">${esc(a.label || a.id)}
+          <span class="chip ${a.present ? 'on' : ''}">${a.present ? 'present' : 'not found'}</span></div>
+        <div class="d">${esc(a.present ? (a.version || a.path || a.bin || 'runs, version not reported')
+          : (a.bin ? 'no ' + a.bin + ' on PATH' : 'no binary configured'))}</div>
+        ${rtChips(rtModels(defs[a.id]))}</div>
+      <button class="tgl ${pickAg(a) ? 'on' : ''}" data-agt="${esc(a.id)}" title="enable this agent"></button>
+    </div>`).join('') || '<div class="empty">no agents defined</div>';
+    epBox.innerHTML = (rtDet.endpoints || []).map(e => {
+      const n = e.model_count != null ? e.model_count : (e.models || []).length;
+      return `<div class="introw wiz-detrow${e.alive ? '' : ' wizoff'}">
+        <span class="idot ${e.alive ? 'green' : 'hollow'}"></span>
+        <div class="grow"><div class="t">${esc(e.name || e.type)}
+            <span class="chip ${e.alive ? 'on' : ''}">${e.alive ? n + (n === 1 ? ' model' : ' models') : 'no response'}</span>
+            ${e.origin === 'saved' ? '<span class="chip">saved</span>' : ''}</div>
+          <div class="d">${esc(e.base_url)}${e.alive ? '' : ' · ' + esc(RT_HINTS[e.type] || 'nothing answering here')}</div>
+          ${e.alive ? rtChips((e.models || []).map(x => ({ id: String(x), ok: true, src: 'probe' }))) : ''}</div>
+        ${e.alive || e.origin === 'saved'
+          ? `<button class="tgl ${pickEp(e) ? 'on' : ''}" data-ept="${esc(e.id)}" title="use this endpoint"></button>` : ''}
+      </div>`;
+    }).join('') || '<div class="empty">nothing probed</div>';
+    const bind = (box, sel, bag) => box.querySelectorAll('[' + sel + ']').forEach(t => {
+      t.onclick = () => { const on = !t.classList.contains('on'); t.classList.toggle('on', on);
+        bag[t.getAttribute('data-' + sel.slice(5))] = on; };   // no server write until Finish
+    });
+    bind(agBox, 'data-agt', rtPick.ag);
+    bind(epBox, 'data-ept', rtPick.ep);
+  };
+
+  const buildStepRT = () => {
+    builtRT = true;
+    stepRT.innerHTML = `<div class="wiz-lead">The AI runtimes we can actually see on this machine. Anything we
+      could not verify is shown as a suggestion — ZENITH never claims a binary or a model is there. Nothing is
+      installed and no command is run from this step; your choices are written when you hit Finish.</div>
+      <div class="wizrt-h">AGENT CLIs<span class="sp"></span>
+        <button class="btn ghost sm" data-a="rescan">↻ RE-SCAN</button></div>
+      <div class="wizrt-agents"></div>
+      <div class="wizrt-h">INFERENCE ENDPOINTS</div>
+      <div class="wizrt-eps"></div>
+      <div class="wizleg"><span class="mchip">confirmed by a live probe</span>
+        <span class="mchip sug">suggested — not verified</span></div>
+      <div class="wizrt-h">ADD A REMOTE ENDPOINT</div>
+      <div class="wizrt-add">
+        <div class="d">A box on your LAN or over Tailscale. This is the only place such an address is ever
+          entered — none ships with ZENITH.</div>
+        <div class="wizrow"><label>Name</label><input data-rf="name" placeholder="workshop box" spellcheck="false"></div>
+        <div class="wizrow"><label>Address</label><input data-rf="base_url" placeholder="http://your-gpu-host:11434" spellcheck="false"></div>
+        <div class="wizrow"><label>Kind</label>
+          <select data-rf="type"><option value="ollama">Ollama</option><option value="openai">OpenAI-compatible</option></select>
+          <button class="btn ghost sm" data-a="rtest">◆ TEST</button></div>
+        <div class="wizrt-tres"></div>
+      </div>`;
+    stepRT.querySelector('[data-a=rescan]').onclick = () => { rtDet = null; rtErr = false; paintRT(); detectRuntimes(true); };
+    const tb = stepRT.querySelector('[data-a=rtest]');
+    const res = stepRT.querySelector('.wizrt-tres');
+    tb.onclick = async () => {                         // read-only probe of what the user typed
+      const f = rtFields();
+      if (!f.base_url) { res.innerHTML = '<span class="chip am">enter an address first</span>'; return; }
+      tb.disabled = true; tb.textContent = '◆ TESTING…';
+      const r = await jpost('/api/providers/test', { base_url: f.base_url, type: f.type });
+      tb.disabled = false; tb.textContent = '◆ TEST';
+      const ms = (r && r.models) || [];
+      res.innerHTML = r && r.ok
+        ? `<span class="chip on">answered · ${ms.length} model${ms.length === 1 ? '' : 's'}</span>`
+          + rtChips(ms.map(x => ({ id: String(x), ok: true, src: 'probe' })))
+        : `<span class="chip rd">no answer</span> ${esc((r && r.error) || 'unreachable')}`;
+    };
+    paintRT();
+  };
+
+  const detectRuntimes = async (refresh) => {
+    const [d, a] = await Promise.all([
+      apiSafe('/api/detect' + (refresh ? '?refresh=1' : ''), undefined, { silent: true }),
+      agentDefs ? null : apiSafe('/api/agents2', undefined, { silent: true })]);
+    if (closed) return;
+    if (a && a.agents) agentDefs = a.agents;           // manifests: the models block per agent
+    if (d && d.agents) { rtDet = d; rtErr = false; } else rtErr = true;
+    paintRT();
+  };
+
+  /* Finish-time writes for step 3 — DIFFERENCES ONLY, so an untouched machine gets
+     no write at all and a skipped step never reaches here. */
+  const saveRuntimes = async () => {
+    if (!builtRT || !rtDet) return;
+    const agChanged = (rtDet.agents || []).filter(a => pickAg(a) !== !!a.enabled);
+    if (agChanged.length) {
+      // /api/agents2/save REPLACES the record, and /api/agents2 rewrites models.list to
+      // the resolved list — echoing that back would read as a user edit and freeze the
+      // shipped-default three-way merge (§9), so save the raw on-disk manifest instead.
+      const bundle = await apiSafe('/api/config/export', undefined, { silent: true });
+      const raw = {};
+      ((bundle && bundle.agents) || []).forEach(x => { if (x && x.id) raw[x.id] = x; });
+      for (const a of agChanged) {
+        if (!raw[a.id]) continue;                      // no manifest on disk → never invent one
+        await jpost('/api/agents2/save', { ...raw[a.id], enabled: pickAg(a) });
+      }
+    }
+    const eps = rtDet.endpoints || [];
+    const manual = rtFields();
+    if (!eps.length && !manual.base_url) return;
+    const pr = await apiSafe('/api/providers', undefined, { silent: true });
+    const provs = (pr && pr.providers) || [];
+    // match on address, not id: a probed loopback port and a saved provider can be the
+    // same box (detection dedupes on address and reports the shipped kind's id).
+    const find = (type, base) => provs.find(p => p && String(p.type || 'ollama') === type
+      && String(p.base_url || '').replace(/\/+$/, '') === base);
+    for (const e of eps) {
+      const want = pickEp(e);
+      const p = provs.find(x => x && x.id === e.id) || find(e.type, e.base_url);
+      if (want === !!(p && p.enabled !== false)) continue;
+      // enabling a *verified alive* endpoint is safe to do from the default; turning one
+      // OFF is only ever the user's explicit click — a probe that missed must not disable
+      // a provider they configured (loopback rows report origin "default" even when saved).
+      if (!want && !(e.id in rtPick.ep)) continue;
+      await jpost('/api/providers/save', p ? { ...p, enabled: want }
+        : { name: e.name || e.type, type: e.type, base_url: e.base_url, api_key: '', enabled: want });
+    }
+    if (manual.base_url) {
+      const p = find(manual.type, manual.base_url);
+      await jpost('/api/providers/save', { ...(p || { api_key: '' }),
+        name: manual.name || (p && p.name) || manual.base_url,
+        type: manual.type, base_url: manual.base_url, enabled: true });
+    }
+  };
+
   const goStep = n => {
     step = n;
-    [step1, step2, step3].forEach((s, i) => s.classList.toggle('show', i === n - 1));
+    [step1, step2, stepRT, step3].forEach((s, i) => s.classList.toggle('show', i === n - 1));
     panel.querySelectorAll('.wiz-steps .s').forEach(d => d.classList.toggle('on', +d.dataset.s <= n));
     btnBack.style.visibility = n === 1 ? 'hidden' : 'visible';
-    btnNext.textContent = n === 3 ? 'Finish ✓' : 'Next →';
+    btnNext.textContent = n === 4 ? 'Finish ✓' : 'Next →';
     if (n === 2 && !built2) buildStep2();
+    if (n === 3 && !builtRT) buildStepRT();
   };
   btnBack.onclick = () => { if (step > 1) goStep(step - 1); };
   btnSkip.onclick = doSkip;
   btnClose.onclick = doSkip;
-  btnNext.onclick = () => { if (step < 3) goStep(step + 1); else doFinish(); };
+  btnNext.onclick = () => { if (step < 4) goStep(step + 1); else doFinish(); };
 
-  // init: show step 1, kick detection, load config for steps 2-3
+  // init: show step 1, kick detection, load config for steps 2-4
   paintDetection();
   goStep(1);
   detect(true);
+  detectRuntimes(true);          // ~3s of timeout-bounded probes, warmed while the user reads step 1
   (async () => {
     cfg = await apiSafe('/api/config', undefined, { silent: true });
     if (closed) return;
@@ -341,10 +531,16 @@ const TerminalLauncherApp = {
         <div><span class="klabel">launch</span><select id="tmode" style="width:100%">
           <option value="shell">shell (zsh)</option>
           <option value="claude">claude — interactive</option>
-          <option value="claude-continue">claude --continue</option></select></div>
+          <option value="claude-continue">claude --continue</option>
+          <option value="prime-agent">prime-agent (gpu-node)</option></select></div>
         <div><span class="klabel">effort</span><select id="teffort" style="width:100%">
           <option value="low">low</option><option value="medium">medium</option>
           <option value="high">high</option></select></div>
+      </div>
+      <div id="twtrow" style="display:none;margin-bottom:10px">
+        <span class="klabel">gpu-node worktree</span>
+        <input type="text" id="twt" style="width:100%" spellcheck="false">
+        <div style="margin-top:4px;color:var(--dim);font-size:11.5px">runs sandboxed on gpu-node; container stops when the terminal exits</div>
       </div>
       <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
         <label style="display:flex;gap:7px;align-items:center;color:var(--dim);font-size:11.5px;cursor:pointer">
@@ -369,17 +565,38 @@ const TerminalLauncherApp = {
     tpersist.checked = defaultPersist();
     tpersist.onchange = () => localStorage.setItem('zen.persist', tpersist.checked ? '1' : '0');
     // Populate the launch dropdown with the enabled non-claude agents (codex/aider),
-    // interactive, inserted between claude and claude --continue.
+    // interactive, inserted between claude and claude --continue. An agent the
+    // dropdown ALREADY offers is skipped: prime-agent is a manifest agent (so it can
+    // be a job and an A/B arm) that also has a hand-built terminal mode of its own,
+    // with a worktree field the generic row cannot render — without this it would
+    // appear twice, and the second one would open a shell.
     const tmode = body.querySelector('#tmode');
     loadEnabledAgents().then(ags => {
       const cont = tmode.querySelector('option[value="claude-continue"]');
-      (ags || []).filter(a => a && a.id && a.id !== 'claude').forEach(a => {
+      (ags || []).filter(a => a && a.id && a.id !== 'claude'
+        && !tmode.querySelector(`option[value="${CSS.escape(a.id)}"]`)).forEach(a => {
         const o = el('option', '', esc((a.label || a.id) + ' — interactive'));
         o.value = a.id;
         tmode.insertBefore(o, cont);
       });
     });
-    const MODE_LABEL = { shell: 'shell', claude: 'claude', codex: 'codex', aider: 'aider', 'claude-continue': 'continue', 'claude-resume': 'resume' };
+    // prime-agent runs on the GPU box, so the launcher asks for the REMOTE worktree
+    // (the local working dir above is only where the ssh is spawned from) and defaults
+    // persistence on — a remote container session is exactly what you want to survive
+    // a browser reload or a server restart.
+    const twtrow = body.querySelector('#twtrow');
+    const twt = body.querySelector('#twt');
+    const paDefaultWt = () => '~/scratch/pa-work/zenith-'
+      + new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+    tmode.onchange = () => {
+      const pa = tmode.value === 'prime-agent';
+      twtrow.style.display = pa ? '' : 'none';
+      if (pa) {
+        if (!twt.value) twt.value = paDefaultWt();
+        tpersist.checked = true;
+      }
+    };
+    const MODE_LABEL = { shell: 'shell', claude: 'claude', codex: 'codex', aider: 'aider', 'claude-continue': 'continue', 'claude-resume': 'resume', 'prime-agent': 'prime-agent' };
     const renderRecents = () => {
       const box = body.querySelector('#trecent');
       const recents = getRecents();
@@ -423,9 +640,14 @@ const TerminalLauncherApp = {
       if (!r.terms.length) tl.appendChild(el('div', 'empty', 'NO LIVE TERMINALS'));
     };
     body.querySelector('#tgo').onclick = async () => {
-      const r = await launchTerm(cwd.value, body.querySelector('#tmode').value,
-        body.querySelector('#tpersist').checked, teffort.value);
-      if (r) { refresh(); renderRecents(); }
+      const mode = tmode.value;
+      const r = await launchTerm(cwd.value, mode,
+        body.querySelector('#tpersist').checked, teffort.value,
+        mode === 'prime-agent' ? twt.value.trim() : undefined);
+      if (r) {
+        if (mode === 'prime-agent') twt.value = paDefaultWt();   // next launch = fresh worktree
+        refresh(); renderRecents();
+      }
     };
     Bus.on('recents:changed', renderRecents, win);
     renderRecents();
@@ -2047,67 +2269,72 @@ function abTplOptions() {
 const OpsApp = {
   id: 'ops', name: 'Ops · Jobs', icon: I.ops, w: 920, h: 660, sep: true, accent: '#ffb45e',
   render(body, win) {
-    body.innerHTML = `<div class="main" style="height:100%">
-      <div style="display:flex;gap:8px;align-items:end;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--line)">
-        <div style="flex:1;min-width:0"><span class="klabel">quick launch — project</span><select id="qlp" style="width:100%"></select></div>
-        <div><span class="klabel">preset</span><select id="qlpre">${presetOptions()}</select></div>
-        <button class="btn acc" id="qlgo" title="launch this preset on the project now">▶</button>
+    body.innerHTML = `<div class="ops-shell">
+      <div class="ops-scroll">
+        <div style="display:flex;gap:8px;align-items:end;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--line)">
+          <div style="flex:1;min-width:0"><span class="klabel">quick launch — project</span><select id="qlp" style="width:100%"></select></div>
+          <div><span class="klabel">preset</span><select id="qlpre">${presetOptions()}</select></div>
+          <button class="btn acc" id="qlgo" title="launch this preset on the project now">▶</button>
+        </div>
+        <div class="h2" style="margin-top:0">LAUNCH HEADLESS CLAUDE</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+          <div><span class="klabel">project</span><select id="jp" style="width:100%"></select></div>
+          <div><span class="klabel">preset</span><select id="jpre" style="width:100%">${presetOptions()}</select></div>
+        </div>
+        <div id="jctxrow" style="display:none;margin-bottom:10px">
+          <span class="klabel">context to send — a raw completion can't read your files, it only sees this
+            (via aider doesn't need it: aider reads the repo itself)</span>
+          <div style="display:flex;gap:10px;align-items:end">
+            <select id="jctx" style="flex:none;width:290px">
+              <option value="none">none — prompt only</option>
+              <option value="diff" selected>uncommitted diff (git status + git diff)</option>
+              <option value="diff-head">last commit (git show HEAD)</option>
+              <option value="files">whole files by glob</option></select>
+            <input id="jglobs" style="flex:1;display:none" placeholder="server.py, static/*.js">
+          </div>
+        </div>
+        <span class="klabel">skills to invoke first</span><div id="jskills" style="margin-bottom:10px"></div>
+        <span class="klabel">chain: run these saved jobs on success</span><div id="jnext" style="margin-bottom:10px"></div>
+        <div style="display:flex;align-items:center;margin:4px 0"><div class="h2" style="margin:0">SAVED JOBS</div>
+          <span id="jsavedn" class="chip" style="margin-left:8px"></span></div>
+        <div id="jsaved"></div>
+        <div class="h2">MISSION LOG</div><div id="jlist"></div>
       </div>
-      <div class="h2" style="margin-top:0">LAUNCH HEADLESS CLAUDE</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
-        <div><span class="klabel">project</span><select id="jp" style="width:100%"></select></div>
-        <div><span class="klabel">preset</span><select id="jpre" style="width:100%">${presetOptions()}</select></div>
-      </div>
-      <span class="klabel">prompt</span>
-      <textarea id="jprompt" rows="4" style="width:100%;resize:vertical"></textarea>
-      <div style="display:flex;gap:10px;margin:10px 0;align-items:end;flex-wrap:wrap">
-        <div><span class="klabel">model source</span><select id="jsrc">
-          <option value="claude">Claude</option>
-          <option value="provider">Local / provider</option></select></div>
-        <span id="jclaudewrap" style="display:flex;gap:10px;align-items:end">
-          <div><span class="klabel">agent</span><select id="jagent"><option value="claude">claude</option></select></div>
-          <div><span class="klabel">model</span><span id="jmwrap">${modelSelectHTML('jm', 'sonnet')}</span></div>
-        </span>
-        <span id="jprovwrap" style="display:none;gap:10px;align-items:end;flex-wrap:wrap">
-          <div><span class="klabel">provider</span><select id="jprov"></select></div>
-          <div><span class="klabel">model</span><select id="jpmodel"><option>…</option></select></div>
-          <label class="small" style="white-space:nowrap;align-self:center"
-            title="run the model as an aider coding agent in the project workspace (edits files) instead of a raw prompt→completion">
-            <input type="checkbox" id="jviaaider"> via aider (coding agent)</label>
-          <div><span class="klabel">task</span><select id="jtask">
-            <option value="chat">chat — free-form answer</option>
-            <option value="review">code review — one call per file, structured</option></select></div>
-        </span>
-        <div><span class="klabel">effort</span><select id="jeff">
-          <option value="low">low</option><option value="medium" selected>medium</option>
-          <option value="high">high</option></select></div>
-        <div><span class="klabel">permissions</span><select id="jmode">
-          <option value="default">read-only-ish (default)</option>
-          <option value="acceptEdits">accept edits</option>
-          <option value="bypassPermissions">BYPASS — danger</option></select></div>
-        <div><span class="klabel">budget usd</span><input id="jb" style="width:80px" placeholder="0.50"></div>
-        <div><span class="klabel">save as</span><input id="jname" style="width:130px" placeholder="job name"></div>
-        <button class="btn ghost" id="jsave">＋ SAVE</button>
-        <button class="btn acc" id="jgo">▶ LAUNCH</button>
-      </div>
-      <div id="jctxrow" style="display:none;margin-bottom:10px">
-        <span class="klabel">context to send — a raw completion can't read your files, it only sees this
-          (via aider doesn't need it: aider reads the repo itself)</span>
-        <div style="display:flex;gap:10px;align-items:end">
-          <select id="jctx" style="flex:none;width:290px">
-            <option value="none">none — prompt only</option>
-            <option value="diff" selected>uncommitted diff (git status + git diff)</option>
-            <option value="diff-head">last commit (git show HEAD)</option>
-            <option value="files">whole files by glob</option></select>
-          <input id="jglobs" style="flex:1;display:none" placeholder="server.py, static/*.js">
+      <div class="ops-composer">
+        <span class="klabel">prompt</span>
+        <textarea id="jprompt" rows="4" style="width:100%;resize:vertical"></textarea>
+        <div style="display:flex;gap:10px;margin-top:10px;align-items:end;flex-wrap:wrap">
+          <div><span class="klabel">model source</span><select id="jsrc">
+            <option value="claude">Claude</option>
+            <option value="provider">Local / provider</option></select></div>
+          <span id="jclaudewrap" style="display:flex;gap:10px;align-items:end">
+            <div><span class="klabel">agent</span><select id="jagent"><option value="claude">claude</option></select></div>
+            <div><span class="klabel">model</span><span id="jmwrap">${modelSelectHTML('jm', 'sonnet')}</span></div>
+          </span>
+          <span id="jprovwrap" style="display:none;gap:10px;align-items:end;flex-wrap:wrap">
+            <div><span class="klabel">provider</span><select id="jprov"></select></div>
+            <div><span class="klabel">model</span><select id="jpmodel"><option>…</option></select></div>
+            <label class="small" style="white-space:nowrap;align-self:center"
+              title="run the model as an aider coding agent in the project workspace (edits files) instead of a raw prompt→completion">
+              <input type="checkbox" id="jviaaider"> via aider (coding agent)</label>
+            <div><span class="klabel">task</span><select id="jtask">
+              <option value="chat">chat — free-form answer</option>
+              <option value="review">code review — one call per file, structured</option></select></div>
+          </span>
+          <div><span class="klabel">effort</span><select id="jeff">
+            <option value="low">low</option><option value="medium" selected>medium</option>
+            <option value="high">high</option></select></div>
+          <div><span class="klabel">permissions</span><select id="jmode">
+            <option value="default">read-only-ish (default)</option>
+            <option value="acceptEdits">accept edits</option>
+            <option value="bypassPermissions">BYPASS — danger</option></select></div>
+          <div><span class="klabel">budget usd</span><input id="jb" style="width:80px" placeholder="0.50"></div>
+          <div><span class="klabel">save as</span><input id="jname" style="width:130px" placeholder="job name"></div>
+          <button class="btn ghost" id="jsave">＋ SAVE</button>
+          <button class="btn acc" id="jgo">▶ LAUNCH</button>
         </div>
       </div>
-      <span class="klabel">skills to invoke first</span><div id="jskills" style="margin-bottom:10px"></div>
-      <span class="klabel">chain: run these saved jobs on success</span><div id="jnext" style="margin-bottom:10px"></div>
-      <div style="display:flex;align-items:center;margin:4px 0"><div class="h2" style="margin:0">SAVED JOBS</div>
-        <span id="jsavedn" class="chip" style="margin-left:8px"></span></div>
-      <div id="jsaved"></div>
-      <div class="h2">MISSION LOG</div><div id="jlist"></div></div>`;
+    </div>`;
     const jp = body.querySelector('#jp'), jpre = body.querySelector('#jpre');
     const jprompt = body.querySelector('#jprompt'), jlist = body.querySelector('#jlist');
     const jskills = body.querySelector('#jskills'), jnext = body.querySelector('#jnext');
@@ -2375,13 +2602,31 @@ const OpsApp = {
     };
     const watch = id => {
       watching = id; offset = 0;
+      // remember what we are streaming: the job lives on the SERVER, so any re-render of
+      // this pane (module respawn, reload, a second browser tab) can re-attach to it
+      // instead of coming back with a blank console. See the resume block at the end.
+      try { localStorage.setItem('zen.ops.watch', id); } catch (e) { /* quota/private mode */ }
       if (!consoleBox) {
         consoleBox = el('div');
         consoleBox.innerHTML = `<div style="display:flex;align-items:center;gap:10px;margin:8px 0">
           <span class="h2" style="margin:0">CONSOLE</span>
           <button class="btn ghost sm" id="jstop">■ STOP</button></div>
-          <div class="console" id="jout"></div>`;
+          <div style="position:relative">
+            <div class="console" id="jout"></div>
+            <button class="btn acc sm" id="jfollow"
+              style="display:none;position:absolute;right:12px;bottom:10px;z-index:2">↓ LATEST</button>
+          </div>`;
         jlist.before(consoleBox);
+        const outEl = consoleBox.querySelector('#jout');
+        const followBtn = consoleBox.querySelector('#jfollow');
+        outEl._follow = followBtn;
+        // scrolling back to the bottom by hand resumes following, so the button is
+        // never the only way out of a paused state
+        outEl.onscroll = () => {
+          const atEnd = outEl.scrollHeight - outEl.scrollTop - outEl.clientHeight < 24;
+          followBtn.style.display = atEnd ? 'none' : 'block';
+        };
+        followBtn.onclick = () => { outEl.scrollTop = outEl.scrollHeight; followBtn.style.display = 'none'; };
         consoleBox.querySelector('#jstop').onclick = () => jpost('/api/job/stop', { id: watching });
       }
       consoleBox.querySelector('#jout').textContent = '';
@@ -2412,8 +2657,14 @@ const OpsApp = {
       if (!r) return;
       if (r.output && r.output.length) {
         const out = consoleBox.querySelector('#jout');
+        // Follow the tail only while the reader IS at the tail. The old code set
+        // scrollTop unconditionally on every poll, so scrolling up to read something
+        // yanked you straight back a beat later — the log was effectively unreadable
+        // while a job streamed. 24px of slack absorbs sub-pixel/zoom rounding.
+        const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 24;
         out.textContent += r.output.join('\n') + '\n';
-        out.scrollTop = out.scrollHeight;
+        if (atBottom) out.scrollTop = out.scrollHeight;
+        else if (out._follow) out._follow.style.display = 'block';   // offer a way back
         offset = r.offset;
       }
       renderFooter(r);
@@ -2455,6 +2706,19 @@ const OpsApp = {
     Bus.on('ops:watch', id => { watch(id); renderJobs(); }, win);
     renderJobs();
     renderSaved();
+    // Re-attach to the job this pane was streaming before it was re-rendered. Output is
+    // server-side and offset-addressed, so watch() (offset 0) + one poll replays the whole
+    // log — a running mission survives a respawn/reload with its console intact. A job the
+    // server no longer knows about drops the pointer instead of leaving a dead empty box.
+    (async () => {
+      let last = null;
+      try { last = localStorage.getItem('zen.ops.watch'); } catch (e) { /* no storage */ }
+      if (!last) return;
+      const r = await apiSafe(`/api/job?id=${encodeURIComponent(last)}&offset=0`, undefined, { silent: true });
+      if (!r) { try { localStorage.removeItem('zen.ops.watch'); } catch (e) { /* no storage */ } return; }
+      if (watching) return;                      // user picked a job while we were asking
+      watch(last); poll();
+    })();
     WM.every(win, () => { renderJobs(); poll(); }, 1800);
   }
 };
@@ -6581,6 +6845,224 @@ const FleetApp = {
   }
 };
 
+/* ================= Builder — full-duplex prime-agent chat (RPC over WS) =================
+   The third face of prime-agent in ZENITH. Jobs show you a finished transcript; the
+   terminal shows you a screen. This shows you the RUN — assistant text as it streams,
+   every tool call as an object with a name, a verdict and a duration — and lets you
+   cut in mid-run with STEER instead of aborting and re-prompting.
+
+   Deliberately NOT xterm: nothing here is a screen. The server hands over structured
+   frames, so the panel is plain DOM and each event can be styled for what it means.
+
+   No local echo of what you type: the `user` frame comes back from the child's own
+   transcript. That costs a round-trip of latency and buys the guarantee that the
+   scrollback shows what the AGENT received, in the order it received it — which is
+   the only ordering that explains a steered run. */
+const BuilderApp = {
+  id: 'builder', name: 'Builder', icon: I.ops, w: 940, h: 660, accent: '#ffb45e',
+  render(body, win) {
+    let ws = null, bid = null, streaming = false, dead = false, retry = null;
+    let curAsst = null, curThink = null;            // open blocks being appended to
+    let curB = null;                                 // last builder_public() we were told
+    const chips = {};                                // tool chip elements by toolCallId
+
+    body.innerHTML = `
+      <div style="display:flex;flex-direction:column;height:100%;gap:8px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="bwt" placeholder="remote worktree (blank = new timestamped one)"
+                 style="flex:1;min-width:220px">
+          <button class="btn acc sm" id="bnew">NEW SESSION</button>
+          <button class="btn ghost sm" id="bend" disabled>END</button>
+        </div>
+        <div id="bhead" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--dim)">
+          <span class="chip">no session</span></div>
+        <div id="blog" style="flex:1;overflow:auto;padding:8px;border:1px solid var(--line,#2a3340);
+             border-radius:8px;background:rgba(0,0,0,.18);font-size:13px;line-height:1.5">
+          <div class="empty">NO BUILDER SESSION — START ONE</div></div>
+        <div style="display:flex;gap:8px;align-items:flex-end">
+          <textarea id="bin" rows="2" placeholder="prompt… (Enter sends, Shift+Enter newline)"
+                    style="flex:1;resize:vertical" disabled></textarea>
+          <div style="display:flex;flex-direction:column;gap:4px">
+            <button class="btn acc sm" id="bsend" disabled>SEND</button>
+            <button class="btn sm" id="bsteer" disabled title="cut in mid-run — delivered after the current tool turn">STEER</button>
+            <button class="btn warn sm" id="babort" disabled>ABORT</button>
+          </div>
+        </div>
+      </div>`;
+    const $ = s => body.querySelector(s);
+    const log = $('#blog'), input = $('#bin'), head = $('#bhead');
+
+    const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    const scroll = was => { if (was) log.scrollTop = log.scrollHeight; };
+    const add = (cls, style, html) => {
+      const was = atBottom();
+      const d = el('div', cls, html); if (style) d.setAttribute('style', style);
+      log.appendChild(d); scroll(was); return d;
+    };
+    const clear = () => { log.innerHTML = ''; curAsst = curThink = null;
+                          Object.keys(chips).forEach(k => delete chips[k]); };
+
+    const setBusy = on => {
+      streaming = on;
+      $('#bsteer').disabled = !on || dead;
+      $('#babort').disabled = !on || dead;
+      $('#bsend').textContent = on ? 'QUEUE' : 'SEND';   // mid-run a send becomes a follow-up
+    };
+    const paintHead = b => {
+      head.innerHTML = !b ? '<span class="chip">no session</span>'
+        : `<span class="chip ${b.status === 'live' ? 'am' : 'rd'}">${esc(b.status || '')}</span>
+           <span class="chip cy" title="remote worktree on the GPU box">${esc(b.worktree || '')}</span>
+           ${b.model ? `<span class="chip">${esc(b.model)}</span>` : ''}
+           ${b.volume ? `<span class="chip" title="named docker volume — the session survives this container">${esc(b.volume)}</span>` : ''}
+           ${b.session ? `<span class="chip" title="prime-agent session id">${esc(String(b.session).slice(0, 8))}</span>` : ''}`;
+    };
+
+    // one projected frame -> one DOM change. Shared by live frames and replay, so a
+    // reconnect rebuilds byte-identical scrollback instead of a second code path.
+    const apply = f => {
+      const was = atBottom();
+      if (f.t === 'assistant') {
+        if (!curAsst) curAsst = add('', 'margin:6px 0;white-space:pre-wrap', '');
+        curAsst.textContent += f.d || ''; scroll(was); return;
+      }
+      if (f.t === 'thinking') {
+        if (!curThink) curThink = add('', 'margin:4px 0;white-space:pre-wrap;color:var(--dim);font-size:11px;border-left:2px solid var(--line,#2a3340);padding-left:8px', '');
+        curThink.textContent += f.d || ''; scroll(was); return;
+      }
+      if (f.t === 'assistant_end') { curAsst = null; curThink = null; return; }
+      if (f.t === 'user') {
+        curAsst = curThink = null;
+        add('', 'margin:10px 0 4px;padding:6px 8px;border-radius:6px;background:rgba(255,180,94,.10);border-left:2px solid var(--acc,#ffb45e);white-space:pre-wrap',
+            esc(f.d || '')); return;
+      }
+      if (f.t === 'tool') {
+        curAsst = curThink = null;
+        if (f.status === 'start') {
+          chips[f.id] = add('', 'margin:4px 0;font-size:11px;font-family:var(--mono,monospace);color:var(--cyan-soft)',
+            `▸ <b>${esc(f.name)}</b> <span style="color:var(--dim)">running…</span>
+             <div style="color:var(--dim);white-space:pre-wrap;margin-left:14px">${esc(f.args || '')}</div>`);
+        } else {
+          const c = chips[f.id];
+          const head2 = `${f.ok ? '✔' : '✖'} <b>${esc(f.name)}</b>
+            <span style="color:var(--dim)">${f.ms != null ? f.ms + 'ms' : ''}</span>`;
+          const out = f.out ? `<div style="color:var(--dim);white-space:pre-wrap;margin-left:14px">${esc(f.out)}</div>` : '';
+          if (c) { c.innerHTML = head2 + out; c.style.color = f.ok ? 'var(--cyan-soft)' : 'var(--red,#ff6b6b)'; delete chips[f.id]; }
+          else add('', 'margin:4px 0;font-size:11px;font-family:var(--mono,monospace)', head2 + out);
+        }
+        return;
+      }
+      if (f.t === 'run') { setBusy(f.phase === 'start'); return; }
+      if (f.t === 'usage') {
+        curAsst = curThink = null;
+        const bits = [f.total != null ? f.total + ' tok' : '', f.model || '',
+                      f.stop && f.stop !== 'stop' ? 'stop: ' + f.stop : ''].filter(Boolean);
+        if (bits.length) add('', 'margin:2px 0 8px;font-size:10px;color:var(--dim)', esc(bits.join(' · ')));
+        return;
+      }
+      if (f.t === 'queued') {
+        if (f.n) add('', 'margin:4px 0;font-size:11px;color:var(--acc,#ffb45e)',
+                     `⟳ ${f.n} steer queued — delivered after the current tool turn`);
+        return;
+      }
+      if (f.t === 'state') {
+        setBusy(!!f.streaming);
+        paintHead({ status: dead ? 'dead' : 'live', worktree: $('#bwt').value,
+                    model: f.model, session: f.session, volume: (curB || {}).volume });
+        return;
+      }
+      if (f.t === 'error') { add('', 'margin:4px 0;font-size:11px;color:var(--red,#ff6b6b);white-space:pre-wrap', esc(f.d || '')); return; }
+      if (f.t === 'note') { add('', 'margin:4px 0;font-size:11px;color:var(--dim)', esc(f.d || '')); return; }
+      if (f.t === 'exit') {
+        dead = true; setBusy(false); input.disabled = true; $('#bsend').disabled = true;
+        $('#bend').disabled = true;
+        add('', 'margin:8px 0;font-size:11px;color:var(--red,#ff6b6b)', 'session ended');
+        // the transcript stays on screen, but stop resurrecting this id on the next render
+        try { localStorage.removeItem('zen.builder.id'); } catch (e) { /* no storage */ }
+      }
+    };
+
+    const connect = () => {
+      if (!bid) return;
+      ws = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/builder?id=${encodeURIComponent(bid)}`);
+      ws.onmessage = ev => {
+        let f; try { f = JSON.parse(ev.data); } catch (e) { return; }
+        // the server buffers every frame, so a replay is the whole scrollback: wipe and
+        // rebuild rather than appending a duplicate tail after a dropped socket.
+        if (f.t === 'replay') { clear(); curB = f.builder || curB; paintHead(curB);
+                                (f.frames || []).forEach(apply); return; }
+        apply(f);
+      };
+      ws.onclose = () => {
+        ws = null;
+        if (dead || !bid) return;
+        add('', 'margin:4px 0;font-size:11px;color:var(--dim)', 'socket dropped — reconnecting…');
+        retry = setTimeout(connect, 1500);      // replay + get_state resync on attach
+      };
+    };
+
+    const send = t => {
+      if (!ws || ws.readyState !== 1) return;
+      const text = input.value;
+      if (t !== 'abort' && !text.trim()) return;
+      ws.send(JSON.stringify({ t, text }));
+      if (t !== 'abort') input.value = '';
+    };
+
+    $('#bnew').onclick = async () => {
+      const btn = $('#bnew'); btn.disabled = true;
+      const r = await apiSafe('/api/builder', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ worktree: $('#bwt').value.trim() }) });
+      btn.disabled = false;
+      if (!r || r.error || !r.id) return;
+      if (retry) clearTimeout(retry);
+      if (ws) { const w = ws; ws = null; w.close(); }
+      bid = r.id; curB = r.builder; dead = false;
+      try { localStorage.setItem('zen.builder.id', bid); } catch (e) { /* quota/private mode */ }
+      $('#bwt').value = (r.builder || {}).worktree || '';
+      clear(); paintHead(curB);
+      input.disabled = false; $('#bsend').disabled = false; $('#bend').disabled = false;
+      win.sub.textContent = '— ' + ((r.builder || {}).label || 'builder');
+      connect();
+    };
+    $('#bend').onclick = async () => {
+      if (!bid) return;
+      await apiSafe('/api/builder/kill', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: bid }) });
+    };
+    $('#bsend').onclick = () => send('prompt');
+    $('#bsteer').onclick = () => send('steer');
+    $('#babort').onclick = () => send('abort');
+    input.onkeydown = e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send('prompt'); }
+    };
+
+    // Re-attach to a builder session that outlived this render. The session is a server-side
+    // process (closing the socket does NOT kill it) and the server buffers every frame, so a
+    // fresh attach replays the entire scrollback. Without this, any re-render of the pane —
+    // a caps:changed module respawn, a page reload, opening ZENITH in a second tab — came up
+    // "NO BUILDER SESSION" while the build was still running, which read as a lost session.
+    (async () => {
+      let saved = null;
+      try { saved = localStorage.getItem('zen.builder.id'); } catch (e) { /* no storage */ }
+      if (!saved) return;
+      const r = await apiSafe('/api/builder/list', undefined, { silent: true });
+      const b = ((r && r.builders) || []).find(x => x.id === saved);
+      if (!b) { try { localStorage.removeItem('zen.builder.id'); } catch (e) { /* no storage */ } return; }
+      if (bid) return;                          // user started a new session while we asked
+      bid = saved; curB = b; dead = b.status !== 'live';
+      $('#bwt').value = b.worktree || '';
+      paintHead(b);
+      input.disabled = dead; $('#bsend').disabled = dead; $('#bend').disabled = dead;
+      win.sub.textContent = '— ' + (b.label || 'builder');
+      connect();                                // replay frame rebuilds the whole transcript
+    })();
+
+    win.cleanup = () => { if (retry) clearTimeout(retry);
+                          if (ws) { const w = ws; ws = null; w.close(); } };
+  }
+};
+
 // ---- Consolidated modules: one dock icon hosting several existing app views as tabs. Each tab renders
 // its app ONCE into its own pane (lazy, on first view) and is kept alive (hidden) after — so cross-app Bus
 // events keep working and view state is preserved. A per-tab sub-window isolates timers/cleanup; switching
@@ -6589,6 +7071,13 @@ function moduleApp(spec) {
   return {
     id: spec.id, name: spec.name, icon: spec.icon, w: spec.w || 900, h: spec.h || 620,
     accent: spec.accent, sep: spec.sep,
+    // .win-body is normally just an overflow:auto scroll box (not a flex container), so a
+    // .mod-stack/.mod-pane's flex:1 sizing never actually engages — the pane's height is
+    // whatever its content wants, and the WHOLE win-body scrolls as one lump. That's fine
+    // for simple content, but it's what let a tab's own internal layout (Ops' bottom-pinned
+    // composer, see .ops-shell) end up unbounded. `.mod-win .win-body` below turns win-body
+    // into a real flex column so height propagates all the way down to .mod-pane.
+    cls: 'mod-win',
     tabs: spec.tabs,                                       // exposed so Caps composition can see the tab set
     render(body, win) {
       const bar = el('div', 'mod-tabs');
@@ -6645,7 +7134,8 @@ const StudioApp = moduleApp({ id: 'studio', name: 'Models · Agents', icon: I.mo
   tabs: [{ key: 'models', label: 'Models', app: ModelsApp }, { key: 'agents', label: 'Agents · Skills', app: AgentsApp }] });
 const RunApp = moduleApp({ id: 'run', name: 'Run', icon: I.ops, accent: '#ffb45e', w: 940, h: 660,
   tabs: [{ key: 'jobs', label: 'Jobs', app: OpsApp }, { key: 'loops', label: 'Loops', app: LoopsApp },
-         { key: 'swarm', label: 'Swarm', app: SwarmApp }, { key: 'watchers', label: 'Watchers', app: WatchersApp }] });
+         { key: 'swarm', label: 'Swarm', app: SwarmApp }, { key: 'watchers', label: 'Watchers', app: WatchersApp },
+         { key: 'builder', label: 'Builder', app: BuilderApp }] });
 const LabApp = moduleApp({ id: 'lab', name: 'Lab', icon: I.ab, accent: '#ffd479', w: 980, h: 660,
   tabs: [{ key: 'ab', label: 'A/B', app: ABApp }, { key: 'gpu', label: 'GPU', app: FleetApp }] });
 const ActivityApp = moduleApp({ id: 'activity', name: 'Activity', icon: I.obs, accent: '#4ef0a6', w: 980, h: 660,
@@ -6665,7 +7155,10 @@ const TerminalApp = moduleApp({ id: 'terminal', name: 'Terminals · Sessions', i
 // that tab (Caps.tabVisible). Verified against the current module wiring below (DocsModApp/RunApp/
 // LabApp). A tab with no entry is always visible: voice deliberately has none (its fallback ends in
 // browser SpeechRecognition, so the mic UI is always meaningful) and homelab gates no tab (it is the
-// watcher git write-through, not a surface).
+// watcher git write-through, not a surface). Builder has none either: its precondition is a
+// data/pa.json with host+rpc, which is server-side endpoint config rather than a Caps integration —
+// unconfigured, POST /api/builder refuses in words, the same honest-refusal path as the terminal's
+// prime-agent mode. A fake integration id here would read as a gate while gating nothing.
 const REQUIRES = {
   'library.memory': 'nexusmind',       // Docs module → Memory tab   (MemoryApp)
   'run.watchers':   'nexusmind_api',   // Run module  → Watchers tab (WatchersApp)
@@ -6676,7 +7169,7 @@ const MODULE_OF = {
   files: { m: 'library', t: 'docs' }, memory: { m: 'library', t: 'memory' },
   agents: { m: 'studio', t: 'agents' }, models: { m: 'studio', t: 'models' },
   ops: { m: 'run', t: 'jobs' }, loops: { m: 'run', t: 'loops' }, swarm: { m: 'run', t: 'swarm' },
-  watchers: { m: 'run', t: 'watchers' },
+  watchers: { m: 'run', t: 'watchers' }, builder: { m: 'run', t: 'builder' },
   ab: { m: 'lab', t: 'ab' }, fleet: { m: 'lab', t: 'gpu' },
   sessions: { m: 'terminal', t: 'sessions' },
   dashboard: { m: 'activity', t: 'overview' }, obs: { m: 'activity', t: 'timeline' }, feed: { m: 'activity', t: 'feed' },

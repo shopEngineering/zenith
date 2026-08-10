@@ -111,6 +111,15 @@ else:
     _state_override = os.environ.get("ZENITH_STATE_DIR")
     ZENITH_STATE_DIR = Path(_state_override).expanduser() if _state_override else ZENITH_DIR
     DATA_DIR = ZENITH_STATE_DIR / "data"
+# ZENITH's own bin/ goes on PATH. A manifest agent whose `bin` is a shipped helper
+# script (bin/pa-job.sh) then resolves by bare name wherever ZENITH is installed —
+# no absolute path in a file that ships. Mutating os.environ rather than just the
+# child env is deliberate: shutil.which (za.resolve_bin), subprocess and every
+# spawned terminal must agree on one PATH, or the agent probe reports "missing"
+# for a binary the job would in fact have found.
+_ZENITH_BIN = ZENITH_DIR / "bin"
+if _ZENITH_BIN.is_dir():
+    os.environ["PATH"] = str(_ZENITH_BIN) + os.pathsep + os.environ.get("PATH", "")
 # Release version — single source of truth (the repo-root VERSION file, bundled as a
 # data file in the packaged builds). Drives the UI version display + the update check.
 # (ZENITH_VERSION above is the internal build tag stamped into events; this is the
@@ -1925,8 +1934,13 @@ def _job_end_payload(job, env):
             "status": job.get("status"), "duration_s": dur,
             "started": job.get("started"),
             "cli_session_id": job.get("cli_session_id"),
-            "subtype": env.get("subtype"), "num_turns": env.get("num_turns"),
+            "subtype": env.get("subtype"),
+            # num_turns is claude's field; prime-agent counts the same thing under
+            # its own name, so the turns column populates for both instead of
+            # going blank on the agent that does report it.
+            "num_turns": env.get("num_turns") or env.get("messages"),
             "permission_denials": env.get("permission_denials"),
+            "tools": env.get("tools"),      # tool executions (prime_agent_jsonl)
             "result": (job.get("result") or "")[:16000],
             "output_tail": "\n".join(job.get("output") or [])[-4000:],
             "envelope_ok": bool(env) and not job.get("_stdout_truncated"),
@@ -5053,6 +5067,8 @@ def tmux_pane_info(session):
         line = line.strip()
         if not line:
             continue
+        if "prime-agent-run.sh" in line:   # the ssh whose remote command is the launcher
+            return "prime-agent", None
         if _is_claude_cmd(line):
             return "claude", _session_id_from_cmd(line)
         exe = os.path.basename(line.split()[0]).lower()
@@ -5213,7 +5229,53 @@ def _term_reader(term):
             pass
 
 
-def _mode_argv(mode, resume_id):
+# --- prime-agent: a session inside the hardened container on the GPU box.
+# Nothing runs locally — the terminal is an ssh whose remote command is the container
+# launcher, so the whole agent lives behind the box's own sandbox (non-root, cap-drop
+# ALL, no published ports, egress-locked, budgeted LiteLLM key) and dies with the ssh.
+# The headless twin of this path is bin/pa-job.sh, which the agent manifest points at
+# for Run/Jobs and A/B arms; both read the same endpoint config.
+#
+# WHERE THE ADDRESS LIVES. data/pa.json — not here. A private box's address is
+# machine-identifying, publish.sh refuses one in anything that ships, and data/ is
+# gitignored, so this is the only place it can sit without leaking into a commit.
+# An install with no pa.json simply has no prime-agent: the mode falls back to a
+# plain shell rather than ssh'ing at a placeholder someone else owns.
+PA_FILE = DATA_DIR / "pa.json"
+_PA_WT_RE = re.compile(r"^[A-Za-z0-9._~/-]{1,200}$")
+
+
+def pa_cfg(key, default=""):
+    """One prime-agent endpoint setting: env (ZENITH_PA_<KEY>) > data/pa.json >
+    default. Read per call rather than cached at import, so editing pa.json takes
+    effect on the next launch instead of the next restart. Never raises."""
+    v = os.environ.get("ZENITH_PA_" + str(key).upper())
+    if not v:
+        cfg = _load_json(PA_FILE, {})
+        v = cfg.get(key) if isinstance(cfg, dict) else None
+    return str(v or default)
+
+
+def pa_worktree(raw):
+    """Validate (or default) the remote worktree for the prime-agent mode.
+
+    The value is interpolated UNQUOTED into a remote shell command — it has to be, so
+    the remote shell expands `~` — and ZENITH has no user auth beyond the network
+    boundary. The charset is therefore the entire defence: no quote, space, `$`,
+    backtick, `;`, `&` or `|` can survive it, so nothing can break out of the command.
+    `..` and a leading `-` are refused on top of that (path escape / argv injection
+    into mkdir and the launcher). Idempotent: re-validating an already-resolved path
+    returns it unchanged, so callers may resolve once and pass the result down."""
+    wt = (raw or "").strip()
+    if not wt:
+        return (pa_cfg("worktree_root", "~/scratch/pa-work").rstrip("/")
+                + "/zenith-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()))
+    if not _PA_WT_RE.match(wt) or ".." in wt or wt.startswith("-"):
+        raise ValueError("bad worktree path — allowed: letters, digits and . _ ~ / -")
+    return wt
+
+
+def _mode_argv(mode, resume_id, worktree=None):
     """The command (argv list) for a launch mode, or None for a plain shell."""
     if mode == "claude":
         return [CLAUDE_BIN]
@@ -5221,6 +5283,20 @@ def _mode_argv(mode, resume_id):
         return [CLAUDE_BIN, "-c"]
     if mode == "claude-resume" and resume_id:
         return [CLAUDE_BIN, "--resume", str(resume_id)]
+    if mode == "prime-agent":
+        host, run = pa_cfg("host"), pa_cfg("run")
+        if not (host and run):
+            # Same honest-refusal idiom as aider-with-no-model below: an
+            # unconfigured install opens a plain shell and says why, rather than
+            # ssh'ing at nothing and hanging on a name that resolves elsewhere.
+            print('ZENITH/OS: prime-agent is not configured — set "host" and "run" '
+                  "in data/pa.json (or ZENITH_PA_HOST / ZENITH_PA_RUN). "
+                  "Opening a plain shell.")
+            return None
+        wt = pa_worktree(worktree)
+        return ["ssh", "-t", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                "-o", "ServerAliveInterval=30", host, "--",
+                f"mkdir -p {wt} && exec {run} {wt}"]
     if mode in ("codex", "aider"):
         return _agent_interactive_argv(mode)
     return None
@@ -5280,7 +5356,7 @@ def _workspace_persist(term):
         # never downgrade a known claude mode to "shell" (re-adopt reports shell)
         if not (mode == "shell" and str(rec.get("mode", "")).startswith("claude")):
             rec["mode"] = mode
-        for k in ("cwd", "effort", "resume_id", "created"):
+        for k in ("cwd", "effort", "resume_id", "created", "worktree"):
             if term.get(k) is not None:
                 rec[k] = term.get(k)
         rec["id"] = term["id"]
@@ -5320,13 +5396,17 @@ def _new_term_record(term_id, pty, cwd, mode, persist, effort, resume_id=None):
             "buf": bytearray(), "conns": [], "lock": threading.Lock()}
 
 
-def spawn_term(cwd, mode="shell", persist=True, resume_id=None, effort=None):
+def spawn_term(cwd, mode="shell", persist=True, resume_id=None, effort=None,
+               worktree=None):
     cwd = str(Path(cwd or HOME).resolve())
     # relax to anywhere under HOME so sessions whose cwd lives elsewhere can resume.
     if not (cwd == str(HOME) or cwd.startswith(str(HOME) + os.sep)):
         raise PermissionError("cwd outside HOME")
     term_id = uuid.uuid4().hex[:10]
-    inner_argv = _mode_argv(mode, resume_id)
+    # prime-agent: the LOCAL cwd is just where the ssh runs from and stays under HOME as
+    # for every other mode; the work happens in `worktree` on the remote box.
+    worktree = pa_worktree(worktree) if mode == "prime-agent" else None
+    inner_argv = _mode_argv(mode, resume_id, worktree)
 
     env = _augment_path(dict(os.environ))
     env["TERM"] = "xterm-256color"
@@ -5353,8 +5433,12 @@ def spawn_term(cwd, mode="shell", persist=True, resume_id=None, effort=None):
         argv = inner_argv or ([shell] if IS_WINDOWS else [shell, "-l"])
         pty = (WinPTY if IS_WINDOWS else UnixPTY)(argv, cwd, env)
 
-    return _start_term(_new_term_record(term_id, pty, cwd, mode, use_tmux, effort,
-                                        str(resume_id) if resume_id else None))
+    rec = _new_term_record(term_id, pty, cwd, mode, use_tmux, effort,
+                           str(resume_id) if resume_id else None)
+    if mode == "prime-agent":   # the remote worktree, not the local cwd, names this window
+        rec["worktree"] = worktree
+        rec["label"] = "pa · " + (worktree.rstrip("/").rsplit("/", 1)[-1] or "remote")
+    return _start_term(rec)
 
 
 def reattach_term(term_id):
@@ -5379,7 +5463,7 @@ def reattach_term(term_id):
 
 def term_public(t):
     return {k: t.get(k) for k in ("id", "cwd", "mode", "persist", "status", "label",
-                                  "created", "effort", "resume_id")}
+                                  "created", "effort", "resume_id", "worktree")}
 
 
 def term_transcript(term_id):
@@ -5494,6 +5578,340 @@ def kill_term(term_id):
     with _terms_lock:
         TERMS.pop(term_id, None)
     return True
+
+
+# ------------------------------------------------------------------ builders
+# The third shape of prime-agent on the GPU box, after the terminal and the job: a
+# FULL-DUPLEX session. An ssh child holds `--mode rpc` open on the remote container,
+# ZENITH owns both of its pipes, and the browser gets a chat panel that can steer the
+# agent WHILE it is running.
+#
+# Why neither of the other two would do. A job's stdin is DEVNULL and it answers
+# exactly once, so there is nothing to steer. A terminal is a PTY carrying ANSI, so
+# the only thing a panel can do with it is draw a screen — no tool call in it is
+# addressable as an object. RPC mode is the one that emits structured events, and
+# structure is the whole reason a Builder panel exists rather than another terminal.
+#
+# THE INJECTION BOUNDARY IS builder_send(). Every command reaching the child's stdin
+# is built as a dict and serialised by json.dumps, so prompt text typed into a browser
+# is JSON-escaped by construction and cannot introduce the newline that would make the
+# child read it as a second command. Same discipline as the base64 prompt on the job
+# path, expressed in the protocol's own encoding instead of around it.
+BUILDERS = {}
+_builders_lock = threading.Lock()
+BUILDER_BUF_MAX = 1200          # projected frames kept for reconnect replay
+_PA_VOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,110}$")
+
+
+def pa_session_volume(worktree):
+    """The docker volume holding this worktree's prime-agent session state.
+
+    Derived from the worktree rather than random, and that IS the persistence design:
+    the same worktree resumes the same session, so killing a builder and opening it
+    again continues the conversation instead of meeting a stranger. Sanitised to
+    docker's own name charset and prefixed, so it can neither collide with an
+    unrelated volume nor start with a dash."""
+    base = (worktree or "").rstrip("/").rsplit("/", 1)[-1] or "default"
+    base = re.sub(r"[^A-Za-z0-9_.-]", "-", base)[:96].lstrip("-.")
+    return "zenith-pa-" + (base or "default")
+
+
+def _builder_argv(worktree, volume):
+    """ssh argv for one RPC child. No -t ON PURPOSE: a TTY makes prime-agent start its
+    interactive UI instead of speaking the protocol, which is the exact opposite of
+    what the terminal mode wants from the same binary."""
+    host, rpc = pa_cfg("host"), pa_cfg("rpc")
+    if not (host and rpc):
+        raise ValueError('prime-agent RPC is not configured — set "host" and "rpc" '
+                         "in data/pa.json (or ZENITH_PA_HOST / ZENITH_PA_RPC)")
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
+            host, "--", f"mkdir -p {worktree} && exec {rpc} {worktree} {volume}"]
+
+
+def _msg_text(content):
+    """Flatten an AgentMessage content field (a string, or a list of typed blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(c.get("text") or "") for c in content
+                       if isinstance(c, dict) and c.get("type") == "text")
+    return ""
+
+
+def _tool_result_text(result):
+    """The readable part of a tool result — its text blocks, or the object itself when
+    it does not follow that shape."""
+    if isinstance(result, dict) and isinstance(result.get("content"), list):
+        parts = [str(c.get("text") or "") for c in result["content"]
+                 if isinstance(c, dict) and c.get("type") == "text"]
+        if parts:
+            return "\n".join(parts)
+    return result
+
+
+def _builder_snip(v, n):
+    s = v if isinstance(v, str) else ("" if v is None else json.dumps(v, default=str))
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def _builder_project(b, o):
+    """One raw RPC event -> the frames the panel actually needs. Returns a list.
+
+    This is a PROJECTION, not a proxy, and that is the point. prime-agent re-sends the
+    ENTIRE accumulated message on every token, so a long answer is thousands of frames
+    each carrying the whole text so far — forwarding the stream verbatim would push
+    megabytes at the browser to convey a few hundred bytes of prose. Everything
+    rendered here comes from the small `assistantMessageEvent` delta and the tool
+    events; the fat `message` mirror is read only where it is the sole carrier of a
+    fact (usage, stop reason, the user message a steer delivered)."""
+    t = o.get("type")
+    if t == "message_update":
+        a = o.get("assistantMessageEvent") or {}
+        at = a.get("type")
+        if at == "text_delta":
+            return [{"t": "assistant", "d": str(a.get("delta") or "")}]
+        if at == "thinking_delta":
+            return [{"t": "thinking", "d": str(a.get("delta") or "")}]
+        if at == "text_end":
+            return [{"t": "assistant_end"}]
+        return []
+    if t == "tool_execution_start":
+        cid = str(o.get("toolCallId") or "")
+        b["tools"][cid] = time.time()
+        return [{"t": "tool", "id": cid, "status": "start",
+                 "name": str(o.get("toolName") or "tool"),
+                 "args": _builder_snip(o.get("args"), 400)}]
+    if t == "tool_execution_end":
+        cid = str(o.get("toolCallId") or "")
+        started = b["tools"].pop(cid, None)
+        # the protocol carries no duration, so time it here: start is the only other
+        # place that sees this toolCallId, and the pair is what the chip needs.
+        f = {"t": "tool", "id": cid, "status": "end",
+             "name": str(o.get("toolName") or "tool"), "ok": not o.get("isError"),
+             "out": _builder_snip(_tool_result_text(o.get("result")), 600)}
+        if started:
+            f["ms"] = int((time.time() - started) * 1000)
+        return [f]
+    if t == "agent_start":
+        b["streaming"] = True
+        return [{"t": "run", "phase": "start"}]
+    if t == "agent_end":
+        b["streaming"] = False
+        return [{"t": "run", "phase": "end"}]
+    if t == "message_end":
+        m = o.get("message") or {}
+        if m.get("role") == "assistant":
+            u = m.get("usage") or {}
+            b["model"] = str(m.get("model") or b.get("model") or "")
+            return [{"t": "usage", "input": u.get("input"), "output": u.get("output"),
+                     "total": u.get("totalTokens"), "model": b["model"],
+                     "cost": (u.get("cost") or {}).get("total"),
+                     "stop": m.get("stopReason")}]
+        if m.get("role") == "user":
+            # the transcript's own echo of what went in — including a steer the panel
+            # never typed as a prompt, so the scrollback stays honest about ordering.
+            return [{"t": "user", "d": _builder_snip(_msg_text(m.get("content")), 4000)}]
+        return []
+    if t == "session_action_update":
+        acts = o.get("actions") or {}
+        return [{"t": "queued", "n": acts.get("queuedCount") or 0,
+                 "steering": [_builder_snip(x, 160) for x in (acts.get("steering") or [])]}]
+    if t == "response":
+        d = o.get("data") or {}
+        if o.get("command") == "get_state" and o.get("success"):
+            b["streaming"] = bool(d.get("isStreaming"))
+            b["session_id"] = str(d.get("sessionId") or "")
+            b["model"] = str((d.get("model") or {}).get("id") or b.get("model") or "")
+            return [{"t": "state", "streaming": b["streaming"], "model": b["model"],
+                     "session": b["session_id"], "messages": d.get("messageCount"),
+                     "queued": (d.get("sessionActions") or {}).get("queuedCount") or 0}]
+        if not o.get("success"):
+            return [{"t": "error",
+                     "d": "%s: %s" % (o.get("command"), o.get("error") or "failed")}]
+        return []
+    if t in ("compaction_start", "compaction_end", "auto_retry_start",
+             "auto_retry_end", "extension_error"):
+        return [{"t": "note", "d": t.replace("_", " "), "detail": _builder_snip(o, 300)}]
+    return []
+
+
+def _builder_emit(b, frame):
+    """Buffer one projected frame for reconnect replay, then fan it out live."""
+    data = json.dumps(frame, default=str).encode()
+    with b["lock"]:
+        buf = b["buf"]
+        # coalesce consecutive text/thinking deltas IN THE BUFFER ONLY. A long answer
+        # is thousands of one-token frames; replaying them individually would cost far
+        # more than the prose is worth, while live connections still receive every
+        # delta as it lands — which is what makes the panel stream rather than blink.
+        if frame.get("t") in ("assistant", "thinking") and buf and \
+                buf[-1].get("t") == frame["t"]:
+            buf[-1]["d"] = (buf[-1].get("d") or "") + (frame.get("d") or "")
+        else:
+            buf.append(dict(frame))
+            if len(buf) > BUILDER_BUF_MAX:
+                del buf[: len(buf) - BUILDER_BUF_MAX]
+        conns = list(b["conns"])
+    for c in conns:
+        try:
+            ws_send(c, data, 1)
+        except OSError:
+            with b["lock"]:
+                if c in b["conns"]:
+                    b["conns"].remove(c)
+
+
+def _builder_reader(b):
+    r"""Parse the child's stdout as strict JSONL and broadcast the projection.
+
+    Binary readline ON PURPOSE. The RPC framing is "split on \n, nothing else",
+    because U+2028/U+2029 are legal inside JSON strings and do appear there. Binary
+    readline splits on b"\n" alone; text mode would also break on a lone \r (universal
+    newlines) and a Node-style line reader would also break on the Unicode separators
+    — either of which corrupts a frame that merely CONTAINS one."""
+    out = b["proc"].stdout
+    while True:
+        try:
+            raw = out.readline()
+        except (OSError, ValueError):
+            raw = b""
+        if not raw:
+            break
+        line = raw.rstrip(b"\r\n").decode("utf-8", "replace").strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            _builder_emit(b, {"t": "error", "d": "unparseable frame: " + line[:200]})
+            continue
+        if isinstance(obj, dict):
+            for frame in _builder_project(b, obj):
+                _builder_emit(b, frame)
+    b["status"] = "dead"
+    b["streaming"] = False
+    _builder_emit(b, {"t": "exit"})
+    try:
+        life = round(time.time() - _iso_epoch(b.get("created")), 0)
+    except (TypeError, ValueError):
+        life = None
+    zs.emit("builder.close", project=b.get("worktree") or "", ref=b["id"],
+            outcome="killed" if b.get("_killed") else "ok", actor="user",
+            data={"worktree": b.get("worktree"), "lifetime_s": life})
+
+
+def _builder_stderr(b):
+    """ssh/docker/launcher failures arrive here, not on stdout — surface them in the
+    panel instead of letting a broken session look merely silent. Also keeps the pipe
+    drained, so a chatty stderr can never block the child."""
+    err = b["proc"].stderr
+    while True:
+        try:
+            raw = err.readline()
+        except (OSError, ValueError):
+            raw = b""
+        if not raw:
+            break
+        line = raw.rstrip(b"\r\n").decode("utf-8", "replace").strip()
+        if line:
+            _builder_emit(b, {"t": "error", "d": line[:400]})
+
+
+def builder_send(b, cmd):
+    r"""Write one JSONL command to the child's stdin.
+
+    ensure_ascii (the json default) is load-bearing here: it escapes U+2028/U+2029 to
+    \uXXXX, so the bytes on the wire are pure ASCII and cannot contain anything a
+    reader might mistake for a record separator — belt and braces on top of the
+    child's own compliant framing."""
+    if b.get("status") != "live":
+        return False
+    line = (json.dumps(cmd) + "\n").encode("utf-8")
+    with b["wlock"]:
+        try:
+            b["proc"].stdin.write(line)
+            b["proc"].stdin.flush()
+            return True
+        except (OSError, ValueError, AttributeError):
+            b["status"] = "dead"
+            return False
+
+
+def builder_command(b, msg):
+    """One browser frame -> one RPC command."""
+    text = str(msg.get("text") or "")
+    t = msg.get("t")
+    if t == "prompt":
+        if not text.strip():
+            return False
+        cmd = {"type": "prompt", "message": text}
+        # a prompt sent mid-run MUST declare what to do with it or the child rejects
+        # it outright. Queueing behind the current run is the least surprising reading
+        # of "send" — STEER is the explicit button for cutting in.
+        if b.get("streaming"):
+            cmd["streamingBehavior"] = "followUp"
+        return builder_send(b, cmd)
+    if t == "steer":
+        return bool(text.strip()) and builder_send(b, {"type": "steer", "message": text})
+    if t == "abort":
+        return builder_send(b, {"type": "abort"})
+    if t == "state":
+        return builder_send(b, {"type": "get_state"})
+    if t == "new":
+        return builder_send(b, {"type": "new_session"})
+    return False
+
+
+def spawn_builder(worktree=None):
+    worktree = pa_worktree(worktree)
+    volume = pa_session_volume(worktree)
+    if not _PA_VOL_RE.match(volume):          # unreachable by construction; the last
+        raise ValueError("bad session volume name")   # gate before an unquoted argv
+    argv = _builder_argv(worktree, volume)
+    bid = uuid.uuid4().hex[:10]
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    b = {"id": bid, "proc": proc, "worktree": worktree, "volume": volume,
+         "status": "live", "streaming": False, "created": now_iso(),
+         "session_id": "", "model": "", "buf": [], "conns": [], "tools": {},
+         "label": "builder · " + (worktree.rstrip("/").rsplit("/", 1)[-1] or "remote"),
+         "lock": threading.Lock(), "wlock": threading.Lock()}
+    with _builders_lock:
+        BUILDERS[bid] = b
+    zs.emit("builder.open", project=worktree, ref=bid, outcome="ok", actor="user",
+            data={"worktree": worktree, "volume": volume})
+    threading.Thread(target=_builder_reader, args=(b,), daemon=True).start()
+    threading.Thread(target=_builder_stderr, args=(b,), daemon=True).start()
+    builder_send(b, {"type": "get_state"})   # seed the panel header before any prompt
+    return bid
+
+
+def kill_builder(bid):
+    b = BUILDERS.get(bid)
+    if not b:
+        return False
+    b["_killed"] = True
+    b["status"] = "dead"
+    try:
+        b["proc"].stdin.close()    # EOF ends the RPC session cleanly; terminate below
+    except (OSError, ValueError, AttributeError):    # is the fallback for a wedged one
+        pass
+    try:
+        b["proc"].terminate()
+    except OSError:
+        pass
+    with _builders_lock:
+        BUILDERS.pop(bid, None)
+    return True
+
+
+def builder_public(b):
+    return {"id": b["id"], "worktree": b.get("worktree"), "volume": b.get("volume"),
+            "label": b.get("label"), "status": b.get("status"),
+            "streaming": bool(b.get("streaming")), "model": b.get("model") or "",
+            "session": b.get("session_id") or "", "created": b.get("created"),
+            "conns": len(b.get("conns") or [])}
 
 
 # --------------------------------------------------- live claude processes
@@ -7508,6 +7926,56 @@ class Handler(BaseHTTPRequestHandler):
                 if conn in term["conns"]:
                     term["conns"].remove(conn)
 
+    def _builder_ws(self, q):
+        """The Builder panel's socket. Same hand-rolled RFC6455 upgrade as the terminal
+        — but the payload is JSON frames both ways rather than a byte stream, because
+        what travels here are events and commands, not screen contents."""
+        b = BUILDERS.get(q.get("id", ""))
+        key = self.headers.get("Sec-WebSocket-Key")
+        if b is None or not key:
+            return self._err("no such builder", 404)
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.close_connection = True
+        conn = {"sock": self.connection, "lock": threading.Lock()}
+        with b["lock"]:
+            replay = [dict(f) for f in b["buf"]]
+            b["conns"].append(conn)
+        try:
+            # replay first, then the live tap — a reload rebuilds the whole scrollback
+            # from the server instead of the panel starting blank mid-conversation.
+            ws_send(conn, json.dumps({"t": "replay", "frames": replay,
+                                      "builder": builder_public(b)}), 1)
+            if b["status"] != "live":
+                ws_send(conn, json.dumps({"t": "exit"}), 1)
+            else:
+                builder_send(b, {"type": "get_state"})   # resync isStreaming on attach
+            while True:
+                opcode, data = ws_recv(self.rfile)
+                if opcode is None or opcode == 8:
+                    break
+                if opcode == 9:
+                    ws_send(conn, data, 10)
+                    continue
+                if opcode not in (1, 2):
+                    continue
+                try:
+                    msg = json.loads(data)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(msg, dict):
+                    builder_command(b, msg)
+        except OSError:
+            pass
+        finally:
+            with b["lock"]:
+                if conn in b["conns"]:
+                    b["conns"].remove(conn)
+
     def _json(self, obj, code=200):
         body = json.dumps(obj, default=str).encode()
         self.send_response(code)
@@ -7701,8 +8169,14 @@ class Handler(BaseHTTPRequestHandler):
             route = url.path
             if route == "/ws/term":
                 return self._term_ws(q)
+            if route == "/ws/builder":
+                return self._builder_ws(q)
             if route == "/ws/session":
                 return self._session_ws(q)
+            if route == "/api/builder/list":
+                with _builders_lock:
+                    return self._json({"builders": [builder_public(x)
+                                                    for x in BUILDERS.values()]})
             if route == "/api/term/list":
                 with _terms_lock:
                     terms = [term_public(t) for t in TERMS.values()]
@@ -8508,12 +8982,26 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("title", ""), body.get("content", ""),
                     body.get("tags", []), body.get("namespace", "default")))
             if url.path == "/api/term":
-                term_id = spawn_term(body.get("cwd"), body.get("mode", "shell"),
-                                     body.get("persist", True),   # tmux-backed by default; survives restarts
-                                     body.get("resume_id"), body.get("effort"))
+                try:
+                    term_id = spawn_term(body.get("cwd"), body.get("mode", "shell"),
+                                         body.get("persist", True),   # tmux-backed by default; survives restarts
+                                         body.get("resume_id"), body.get("effort"),
+                                         body.get("worktree"))   # prime-agent mode only
+                except ValueError as e:
+                    return self._err(str(e), 400)
                 return self._json({"id": term_id, "term": term_public(TERMS[term_id])})
             if url.path == "/api/term/kill":
                 return self._json({"ok": kill_term(body.get("id", ""))})
+            if url.path == "/api/builder":
+                try:
+                    bid = spawn_builder(body.get("worktree"))
+                except ValueError as e:
+                    return self._err(str(e), 400)
+                except OSError as e:
+                    return self._err("could not start builder: " + str(e)[:160], 502)
+                return self._json({"id": bid, "builder": builder_public(BUILDERS[bid])})
+            if url.path == "/api/builder/kill":
+                return self._json({"ok": kill_builder(body.get("id", ""))})
             if url.path == "/api/fx/media/delete":
                 return self._json(fx_media_delete(body.get("name")))
             if url.path == "/api/claude/kill":
@@ -8623,7 +9111,10 @@ def _reconstruct_workspace():
         if not Path(cwd).is_dir():
             cwd = str(HOME)
         sid, rid, mode = rec.get("session_id"), rec.get("resume_id"), rec.get("mode") or "shell"
-        if sid:
+        if mode == "prime-agent":
+            # re-open the SAME remote worktree; the container itself died with the box
+            argv = _mode_argv(mode, None, rec.get("worktree"))
+        elif sid:
             argv = [CLAUDE_BIN, "--resume", str(sid)]        # exact conversation
         elif mode == "claude-resume" and rid:
             argv = [CLAUDE_BIN, "--resume", str(rid)]

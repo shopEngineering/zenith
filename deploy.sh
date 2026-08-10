@@ -41,7 +41,7 @@ done
 # gpu_nodes.json, deploy.env and the event store — machine state the repo must
 # never overwrite.
 FILES=(server.py zenith_agents.py zenith_store.py launch-zenith.sh VERSION)
-DIRS=(static scripts defaults)
+DIRS=(static scripts defaults bin)
 
 c(){ printf '\033[%sm%s\033[0m' "$1" "$2"; }
 ok(){   printf '  %s %s\n' "$(c 32 '✓')" "$*"; }
