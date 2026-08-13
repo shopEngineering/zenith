@@ -298,8 +298,18 @@ const WM = {
     // (autolayout) persist independently of the "restore exact positions" toggle.
     const useExact = (opts && opts.exact) || (opts && opts.restore && geo.tiled);
     const pos = useExact ? { x: geo.x, y: geo.y } : this.avoidOverlap(geo.x, geo.y);
+    // A geometry saved on a bigger canvas (another UI scale, a wider browser window) would put the
+    // title bar — and its buttons — off the edge, out of reach. Fit it to the canvas we actually
+    // have, when we have one (the desktop is display:none until boot finishes → clientWidth 0).
+    const box = this.desktopBox();
+    let gw = geo.w, gh = geo.h;
+    if (box.w > 320 && box.h > 240) {
+      gw = Math.min(gw, box.w); gh = Math.min(gh, box.h);
+      pos.x = Math.max(0, Math.min(pos.x, box.w - gw));
+      pos.y = Math.max(0, Math.min(pos.y, box.h - gh));
+    }
     Object.assign(w.style, { left: pos.x + 'px', top: pos.y + 'px',
-      width: geo.w + 'px', height: geo.h + 'px', zIndex: ++this.z });
+      width: gw + 'px', height: gh + 'px', zIndex: ++this.z });
 
     const head = el('div', 'win-head');
     // The app icon IS the auto-arrange toggle: lit = this window joins the arrangement,
@@ -416,6 +426,11 @@ const WM = {
     this.saveGeo(win);
   },
   focus(win) {
+    // Bringing a window to the front ends a "show desktop" peek. This is the one choke point
+    // every path funnels through — spawn() calls it for both a brand-new and a re-surfaced
+    // window — so ⌘K, a dock icon, a cross-app nav or a fresh terminal can never open into
+    // an invisible desktop. The window being focused just arrives on a normal desktop.
+    if (this.peeked) this.setPeek(false);
     for (const w of this.wins.values()) w.el.classList.remove('focus');
     win.el.classList.add('focus');
     win.el.style.zIndex = ++this.z;
@@ -969,6 +984,7 @@ const WM = {
     return out;
   },
   tile(filterFn, opts) {
+    if (this.peeked) this.setPeek(false);   // arranging windows you can't see helps nobody
     opts = opts || {};
     const mode = opts.mode || Settings.load().arrangeMode || 'tiled';
     let wins = this.visibleWins(filterFn);
@@ -1019,6 +1035,7 @@ const WM = {
     opts.label && toast('arranged ' + n + ' · ' + mode, 'ok');
   },
   cascade(filterFn) {
+    if (this.peeked) this.setPeek(false);   // same as tile(): show the result of the arrange
     let wins = this.visibleWins(filterFn);
     if (!filterFn) {
       const includeOff = Settings.load().arrangeInclude?.cascade === true;
@@ -1078,6 +1095,11 @@ const WM = {
     Dock.update();
   },
   switchDesktop(n) {
+    // A peek belongs to the desktop it was taken on, so navigating away ends it: desktop N's
+    // windows are put back before you leave, and the desktop you land on shows its own windows
+    // normally. Nothing is left invisible on a workspace you can't see. (Deliberately before
+    // the same-desktop early return, so ⌃1 while peeked on desktop 1 is also a way back.)
+    if (this.peeked) this.setPeek(false);
     n = Math.max(1, Math.min(this.desktopCount(), n | 0));
     if (n === this.activeDesktop) { this.closeExpose(); return; }
     this.activeDesktop = n;
@@ -1150,9 +1172,17 @@ const WM = {
     host.replaceChildren();
     const has = this.desksWithWindows();
     for (let i = 1; i <= c; i++) {
-      const b = el('button', 'dsw' + (i === this.activeDesktop ? ' on' : '') + (has.has(i) ? ' filled' : ''), String(i));
-      b.title = 'Desktop ' + i + ' (⌃' + i + ')';
-      b.onclick = () => this.switchDesktop(i);
+      const active = i === this.activeDesktop;
+      const b = el('button', 'dsw' + (active ? ' on' : '') + (has.has(i) ? ' filled' : '')
+        + (active && this.peeked ? ' peeking' : ''), String(i));
+      // Clicking the desktop you are already on toggles its windows away and back. The
+      // click-the-bare-desktop gesture cannot do this when an arrangement tiles windows
+      // edge to edge, because there is then no bare desktop left to click — this button is
+      // always there. Switching to a DIFFERENT desktop still just switches.
+      b.title = active
+        ? (this.peeked ? 'Show desktop ' + i + '’s windows again' : 'Hide desktop ' + i + '’s windows (show the background)')
+        : 'Desktop ' + i + ' (⌃' + i + ')';
+      b.onclick = () => (active ? this.togglePeek() : this.switchDesktop(i));
       host.appendChild(b);
     }
     if (c < 6) { const add = el('button', 'dsw add', '＋'); add.title = 'Add a desktop';
@@ -1162,6 +1192,7 @@ const WM = {
   },
   // Exposé — zoom out to all desktops as proportional mini-maps
   expose() {
+    if (this.peeked) this.setPeek(false);   // "show me everything" is the opposite of a peek
     if (this.desktopCount() < 2) return;
     if (document.getElementById('expose')) { this.closeExpose(); return; }
     const ov = el('div'); ov.id = 'expose';
@@ -1195,8 +1226,94 @@ const WM = {
   closeExpose() {
     const ov = document.getElementById('expose');
     if (ov) { ov.classList.remove('show'); setTimeout(() => ov.remove(), 160); }
+  },
+
+  /* ---- "show desktop": click the bare desktop to get the background, click again to get
+     the windows back ------------------------------------------------------------------
+     Purely VISUAL and deliberately state-free: nothing is closed, unmounted, moved or
+     saved. A hidden window keeps its geometry, its tiled/arranged membership, its z-order
+     and (the one that would really hurt) its live terminal PTY — only a CSS class moves.
+     `_peekSet` is the EXACT set that went away, so the restore can't over-deliver: a
+     window already minimized when you hid stays minimized, and one closed while hidden
+     does not come back. Never persisted — see the note on the click wiring below. */
+  peeked: false,
+  _peekSet: null,
+  setPeek(on) {
+    on = !!on;
+    if (on === this.peeked) return;
+    if (on) {
+      const wins = this.visibleWins();     // active desktop only, minimized excluded — that IS the set
+      if (!wins.length) return;            // nothing to hide; the background is already showing
+      this._peekSet = new Set(wins);
+      wins.forEach(w => { w.el.classList.remove('peek-in'); w.el.classList.add('peek-hide'); });
+      this.peeked = true;
+      this._peekSync();
+      this._peekHint();
+    } else {
+      // drop anything that was closed (or replaced) while hidden — `wins` is the live registry
+      const back = [...(this._peekSet || [])].filter(w => w.el && this.wins.get(w.app.id) === w);
+      this._peekSet = null;
+      this.peeked = false;
+      this._peekSync();
+      back.forEach(w => {
+        w.el.classList.remove('peek-hide');
+        // display is owned by minimize()/applyDesktopVisibility() and was never touched here,
+        // so a window minimized or sent to another desktop meanwhile simply stays gone.
+        if (w.el.style.display !== 'none') w.el.classList.add('peek-in');
+      });
+      // peek-in is left on. Taking it off would drop the element back to .win's winopen,
+      // and a changed animation-name restarts it: the windows returned, then blinked out
+      // and faded in again. setPeek(true) removes it on the next hide. See the CSS note.
+    }
+  },
+  togglePeek() { this.setPeek(!this.peeked); },
+  // the switcher shows which state you are in, so it has to be redrawn whenever it changes
+  _peekSync() { try { this.refreshSwitcher(); } catch (e) { /* switcher not mounted yet */ } },
+  // The way back is one more click on the same empty space, which is not self-evident the
+  // first time your whole desktop blinks out — say it, a few times, then stop nagging.
+  _peekHint() {
+    let n = 0;
+    try { n = +localStorage.getItem('zen.peekhint') || 0; } catch (e) { /* no storage */ }
+    if (n >= 3) return;
+    try { localStorage.setItem('zen.peekhint', String(n + 1)); } catch (e) { /* quota */ }
+    toast('windows hidden — click the desktop number again (or press Esc) to bring them back', 'ok');
   }
 };
+
+/* ---- the click that drives it ------------------------------------------------------
+   The whole difficulty is firing on a deliberate click on bare canvas and NOTHING else:
+   • `e.target === desk` on both press and release. A click inside a window, on the dock,
+     the topbar, the Settings drawer, a popover, the palette or the exposé can never match
+     — those are either inside a `.win` or not inside `#desktop` at all.
+   • the press must have landed on the desktop itself, so the mouseup that ends a window
+     drag or resize cannot synthesise a toggle: those gestures start on a `.win` header or
+     handle, which pointer-captures them, so `#desktop` never sees the press and stays
+     disarmed no matter where the release happens.
+   • plus a movement threshold, so press-drag-release across the background (a stray
+     swipe, a text-selection sweep) is not a click either.
+   • primary button, no modifiers, and only the first click of a multi-click, so a
+     double-click toggles once instead of flickering.
+   NOT persisted across a reload, on purpose: this is a peek at the wallpaper, not a mode.
+   A restored-but-invisible desktop is exactly the "where did my windows go" bug the state
+   is supposed to avoid, and the reopened windows would be new objects anyway, so the
+   "exactly this set" guarantee could not survive the trip. Reload always shows windows. */
+(function wireDesktopPeek() {
+  const desk = document.getElementById('desktop');
+  if (!desk) return;
+  let armed = false, ax = 0, ay = 0;
+  desk.addEventListener('pointerdown', e => {
+    armed = e.target === desk && e.isPrimary && e.button === 0
+      && !(e.metaKey || e.ctrlKey || e.altKey || e.shiftKey);
+    ax = e.clientX; ay = e.clientY;
+  });
+  desk.addEventListener('pointercancel', () => { armed = false; });
+  desk.addEventListener('click', e => {
+    const hit = armed && e.target === desk && e.detail <= 1
+      && Math.abs(e.clientX - ax) + Math.abs(e.clientY - ay) < 6;
+    armed = false;
+    if (hit) WM.togglePeek();
+  });
+})();
 
 /* ================= dock ================= */
 const Dock = {
@@ -1225,7 +1342,9 @@ const Dock = {
         // (switchDesktop only reassigns focus when the target desktop has a window), so
         // the old check minimized it instead of pulling it over — the icon looked like a
         // no-op and a running window "vanished". Elsewhere → always open (= bring here).
-        const here = w && (w.desktop || 1) === WM.activeDesktop;
+        // While the desktop is peeked the window is hidden, so it is NOT "in front of you" —
+        // its stale .focus class would otherwise minimize it instead of bringing it back.
+        const here = w && (w.desktop || 1) === WM.activeDesktop && !WM.peeked;
         if (w && !w.min && here && w.el.classList.contains('focus')) WM.minimize(w);
         else WM.open(app.id);
       };
@@ -1402,11 +1521,78 @@ setInterval(() => {
 addEventListener('online', () => Wake.pulse());
 document.addEventListener('visibilitychange', () => { if (!document.hidden) Wake.pulse(); });
 
-/* ================= UI scale ================= */
+/* ================= UI scale =================
+   `zoom` on <body> scales layout, and the browser then hands JS TWO coordinate spaces:
+     VISUAL px (already multiplied by the zoom) — getBoundingClientRect/getClientRects,
+       MouseEvent client/page coords, innerWidth/innerHeight, elementFromPoint arguments;
+     LAYOUT px (unscaled)                      — style.left/top, offsetLeft/offsetWidth,
+       clientWidth, canvas pixels, xterm's cell metrics.
+   Painting and the browser's own hit-testing stay consistent, so a plain <button> is fine.
+   What breaks is every place that MIXES the two spaces, and the error is exactly the scale
+   factor times the distance from the origin. Measured at 125%: a dragged window ran 30px
+   ahead of the pointer per 120px of travel; tiling clamped against innerWidth put title-bar
+   buttons ~285px off-screen; and xterm — pixel→cell via (clientX − rect.left) / cell.css.width,
+   i.e. visual ÷ layout — mapped a click 13 columns (122px) to the right of the character under
+   the cursor, growing with distance from the terminal's left edge. That is the "clicks land
+   up-and-left of the pointer" report: you had to aim back by (scale−1) × distance.
+   Fix: normalise the visual-space APIs to LAYOUT px once, right here, so the whole app AND
+   the libraries inside it (xterm) share one coordinate space again — no per-call-site maths,
+   and nothing new can reintroduce the mismatch. At 100% every wrapper is a pass-through.
+   NB: keep client coords and elementFromPoint on the same side of this — both are layout px
+   after this point. */
+let UISCALE = 1;
+const uiScale = () => UISCALE;
+(function normaliseCoordSpace() {
+  const scaleRect = r => { const k = 1 / UISCALE; return new DOMRect(r.x * k, r.y * k, r.width * k, r.height * k); };
+  const gbcr = Element.prototype.getBoundingClientRect;
+  Element.prototype.getBoundingClientRect = function () {
+    const r = gbcr.call(this); return UISCALE === 1 ? r : scaleRect(r);
+  };
+  const gcr = Element.prototype.getClientRects;
+  Element.prototype.getClientRects = function () {
+    const l = gcr.call(this); return UISCALE === 1 ? l : Array.from(l, scaleRect);
+  };
+  for (const p of ['clientX', 'clientY', 'pageX', 'pageY', 'x', 'y']) {
+    const d = Object.getOwnPropertyDescriptor(MouseEvent.prototype, p);
+    if (!d || !d.get) continue;
+    Object.defineProperty(MouseEvent.prototype, p, { configurable: true, enumerable: d.enumerable,
+      get() { const v = d.get.call(this); return UISCALE === 1 ? v : v / UISCALE; } });
+  }
+  for (const p of ['innerWidth', 'innerHeight']) {
+    const d = Object.getOwnPropertyDescriptor(window, p) || Object.getOwnPropertyDescriptor(Window.prototype, p);
+    if (!d || !d.get) continue;
+    Object.defineProperty(window, p, { configurable: true, enumerable: true,
+      get() { const v = d.get.call(window); return UISCALE === 1 ? v : v / UISCALE; } });
+  }
+  for (const m of ['elementFromPoint', 'elementsFromPoint']) {   // fed client coords => layout px
+    const f = Document.prototype[m];
+    if (!f) continue;
+    Document.prototype[m] = function (x, y) {
+      return UISCALE === 1 ? f.call(this, x, y) : f.call(this, x * UISCALE, y * UISCALE);
+    };
+  }
+})();
 function applyScale() {
   const pct = parseInt(localStorage.getItem('zen.scale') || '100');
   document.documentElement.style.fontSize = pct + '%';
   document.body.style.zoom = (pct / 100).toString();
+  UISCALE = pct / 100;                        // keep the coordinate normaliser in step
+  dispatchEvent(new Event('resize'));         // canvases/dock/terminals are sized in layout px
+  // Scaling up shrinks the logical desktop (125% of a 1440px screen is a 1152px canvas), so a
+  // layout computed at the old size can hang off the edge with its title-bar buttons out of
+  // reach. Re-fit once the new zoom has laid out.
+  requestAnimationFrame(() => {
+    if (!WM.wins || !WM.wins.size) return;
+    const { w: W, h: H } = WM.desktopBox();
+    for (const win of WM.wins.values()) {
+      if (win.min || win.el.classList.contains('tiled')) continue;
+      const st = win.el.style;
+      if ((parseInt(st.width) || 0) > W) st.width = W + 'px';
+      if ((parseInt(st.height) || 0) > H) st.height = H + 'px';
+    }
+    if (WM.arranged) WM.tile(null, {});       // quiet re-tile: slots are sized from desktopBox
+    WM.clampFree();
+  });
 }
 function setScale(pct) {
   localStorage.setItem('zen.scale', String(pct));
@@ -2079,34 +2265,64 @@ function openTermWindow(t, opts) {
         }
       };
       const openLink = h => h.kind === 'url' ? window.open(h.raw, '_blank', 'noopener') : openTermPath(h.raw);
-      // Reconstruct the full LOGICAL line that buffer row `row0` (0-based) belongs to — a path/URL that
-      // wraps a narrow pane is otherwise split across rows and never matched.
-      const logicalLine = row0 => {
-        const buf = term.buffer.active, cols = term.cols;
-        let first = row0;
-        while (first > 0 && buf.getLine(first)?.isWrapped) first--;
-        let text = '';
-        for (let r = first; r < buf.length; r++) {
-          const ln = buf.getLine(r);
-          if (!ln || (r > first && !ln.isWrapped)) break;
-          let s = ln.translateToString(false);
-          s = s.length < cols ? s.padEnd(cols, ' ') : s.slice(0, cols);
-          text += s;
+      // URL first: PATH_RE also matches the tail of a web URL ending in an extension, and
+      // scanLine drops whichever overlaps a match already claimed (see term-links.js).
+      const LINK_PATS = [{ re: URL_RE, kind: 'url' }, { re: PATH_RE, kind: 'path' }];
+      // One row of the buffer as CELLS, not as a string. Cell counts and character counts
+      // are different numbers the moment output holds an emoji, CJK or box drawing, and
+      // reconstructing a wrapped line from strings splits the URL exactly at the seam.
+      const cellBuf = () => term.buffer.active.getNullCell();
+      const readRow = r => {
+        const ln = term.buffer.active.getLine(r);
+        if (!ln) return null;
+        const cells = [], tmp = cellBuf();
+        for (let x = 0; x < term.cols; x++) {
+          const cell = ln.getCell(x, tmp);
+          if (!cell) { cells.push(' '); continue; }
+          if (cell.getWidth() === 0) { cells.push(null); continue; }   // wide char's 2nd cell
+          const ch = cell.getChars();
+          cells.push(ch === '' ? ' ' : ch);
         }
-        return { text, first, cols };
+        return { cells, isWrapped: ln.isWrapped };
       };
-      const scanText = text => {   // all file-path + URL hits in a logical line
-        const out = [];
-        for (const m of text.matchAll(PATH_RE)) out.push({ raw: m[0], idx: m.index, kind: 'path' });
-        for (const m of text.matchAll(URL_RE)) out.push({ raw: m[0], idx: m.index, kind: 'url' });
-        return out;
+      // An app can declare a hyperlink outright with OSC 8, in which case the terminal holds
+      // the real target and no amount of reading the screen can beat it — the visible text
+      // may be elided, styled, or wrapped anywhere. Our capture-phase click runs before
+      // xterm's own handling, so without this it would open the text instead of the target.
+      // Best-effort: the accessors are internal, so anything unexpected just falls through
+      // to matching the visible text.
+      const oscLinkAt = (bufRow, col) => {
+        try {
+          const ln = term.buffer.active.getLine(bufRow);
+          const cell = ln && ln.getCell(col);
+          const id = cell && cell.extended && cell.extended.urlId;
+          if (!id) return null;
+          const data = term._core._oscLinkService.getLinkData(id);
+          return data && data.uri ? { raw: data.uri, kind: 'url' } : null;
+        } catch (e) { return null; }
+      };
+      // hover fires per mouse move; the answer only changes when the row does
+      let _lineMemo = null;
+      const lineAt = row0 => {
+        const buf = term.buffer.active;
+        if (_lineMemo && _lineMemo.row0 === row0 && _lineMemo.len === buf.length
+            && _lineMemo.cols === term.cols) return _lineMemo.val;
+        const val = logicalLineAt(readRow, row0, buf.length);
+        val.hits = scanLine(val.text, val.map, LINK_PATS);
+        _lineMemo = { row0, len: buf.length, cols: term.cols, val };
+        return val;
       };
       // xterm's own link handling — gives the hover underline + click when NO app owns the mouse (plain shell).
       term.registerLinkProvider({
         provideLinks(y, cb) {
-          const { text, first, cols } = logicalLine(y - 1);
-          const at = i => ({ x: (i % cols) + 1, y: first + Math.floor(i / cols) + 1 });
-          const links = scanText(text).map(h => ({ text: h.raw, range: { start: at(h.idx), end: at(h.idx + h.raw.length) }, activate: () => openLink(h) }));
+          const { hits } = lineAt(y - 1);
+          const links = hits.map(h => ({
+            text: h.raw,
+            // xterm ranges are 1-based and inclusive of the end cell
+            range: { start: { x: h.from.col + 1, y: h.from.row + 1 },
+              end: { x: h.to.col + 1, y: h.to.row + 1 } },
+            activate: () => openLink(h),
+          }));
           cb(links.length ? links : undefined);
         }
       });
@@ -2122,10 +2338,12 @@ function openTermWindow(t, opts) {
         const col = Math.floor((ev.clientX - rect.left) / dim.width);
         const rowInView = Math.floor((ev.clientY - rect.top) / dim.height);
         const bufRow = term.buffer.active.viewportY + rowInView;
-        const { text, first, cols } = logicalLine(bufRow);
-        const clickIdx = (bufRow - first) * cols + col;
-        for (const h of scanText(text)) if (clickIdx >= h.idx && clickIdx < h.idx + h.raw.length) return h;
-        return null;
+        const osc = oscLinkAt(bufRow, col);          // a declared link beats a matched one
+        if (osc) return osc;
+        const { map, hits } = lineAt(bufRow);
+        // resolve the clicked CELL back to its character, so a click anywhere inside a
+        // link — including on a row the link merely continues onto — returns the whole one
+        return hitAt(hits, indexOfCell(map, bufRow, col));
       };
       holder.addEventListener('mousemove', ev => {   // pointer cursor over a link (set on the screen el for specificity)
         const screen = term.element && term.element.querySelector('.xterm-screen');
@@ -2432,6 +2650,8 @@ const Palette = {
       { icon: I.tile, label: 'Arrange: cascade', kw: 'cascade window stagger', run: () => WM.applyArrange('cascade') },
       { icon: I.tile, label: 'Cycle arrange mode', kw: 'cycle arrange columns tiles cascade', run: () => WM.cycleArrange() },
       { icon: I.tile, label: 'Tile terminals only', kw: 'tile terminal', run: () => WM.tile(id => id.startsWith('term:'), { label: 'terminals' }) },
+      // reachable with ONE desktop too, where the switcher — and so its toggle — is hidden
+      { icon: I.tile, label: 'Hide windows / show the background', kw: 'peek hide windows show desktop background wallpaper toggle', run: () => WM.togglePeek() },
       { icon: I.tile, label: 'Show all desktops (Exposé)', kw: 'expose desktop workspace show all overview', run: () => { if (WM.desktopCount() < 2) WM.setDesktopCount(2); WM.expose(); } },
       { icon: I.tile, label: 'New desktop', kw: 'new desktop workspace add virtual screen', run: () => { WM.setDesktopCount(WM.desktopCount() + 1); WM.switchDesktop(WM.desktopCount()); } },
       { icon: I.tile, label: 'Next desktop', kw: 'next desktop workspace switch', run: () => WM.stepDesktop(1) },
@@ -2564,7 +2784,9 @@ addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if ((e.metaKey || e.ctrlKey) && k === 'k' && !e.shiftKey) { e.preventDefault();
     $('#pal').classList.contains('show') ? Palette.close() : Palette.open(); return; }
-  if (e.key === 'Escape') { if (document.getElementById('expose')) WM.closeExpose(); Palette.close(); return; }
+  if (e.key === 'Escape') { if (document.getElementById('expose')) WM.closeExpose();
+    if (WM.peeked) WM.setPeek(false);   // keyboard way back out of "show desktop"
+    Palette.close(); return; }
   // ---- virtual-desktop navigation (Control scheme by default, editable in Settings) ----
   if (WM.desktopCount() > 1) {
     const base = Settings.load().deskScheme === 'ctrl+alt' ? 'alt+ctrl' : 'ctrl';   // sorted
@@ -2721,6 +2943,7 @@ const FX_DEFAULTS = {
   // --- opt-in ambient layer (see initFX). ALL default false: an existing install
   // must render exactly what it rendered before, and each is individually switchable.
   deepNebula: false, solarSystem: false, aurora: false, constellations: false,
+  lavaLamp: false,
   codeRain: false, circuit: false, radar: false,
   fxIntensity: 1,      // master opacity for the ambient layers, 0.3–1.6
   // --- whimsy: something crosses the screen every now and then ---
@@ -2731,6 +2954,7 @@ const FX_DEFAULTS = {
   flybyCustom: [],     // user sprites: {id,name,file,src,on}
   fxMedia: [],         // custom GIF/image background layers: {id,name,file,url,on,pos,size,opacity,blend,motion,speed}
   fxp: {},             // per-effect parameters, defaults in FX_SPECS
+  fxOpen: null,        // which effect category is expanded (accordion); null = all closed
   // --- CSS overlays (front of everything, no canvas cost) ---
   sweep: false, flicker: false, hud: false, glitch: false,
   glowLevel: 1,        // active-window glow intensity, continuous 0–2 (0 = none, 1 = normal)
@@ -2821,6 +3045,7 @@ const Settings = {
     r.setProperty('--panel', `rgba(8,17,26,${s.panelAlpha != null ? +s.panelAlpha : .92})`);
     document.body.dataset.motion = s.motionLevel || 'full';
     applyColors();   // base / UI text / terminal — each axis independent (applyColors)
+    applyFXVars();   // per-effect knobs for the CSS-driven layers
     applyFont(s.uiFont);   // display/mono typeface
     document.body.dataset.density = s.density || 'comfortable';   // whitespace density
     if (typeof renderFXMedia === 'function') renderFXMedia();   // custom GIF/image layers
@@ -2869,36 +3094,52 @@ function initStars() {
     const s = Settings.load();
     if ((s.starDensity || 1) !== lastDensity) build();
     ctx.clearRect(0, 0, c.width, c.height);
-    const COL = { c: ACCENT_RGB, v: '175,150,255', w: '212,230,242' };   // 'c' tracks the theme
+    // 'c' tracks the theme accent, or the starfield's own hue when Colour is set to Custom.
+    // Resolved here rather than through _fxHue because the starfield runs its own frame
+    // loop, outside the one that parks a per-effect hue for initFX's draw functions.
+    const sHue = typeof fxHueOf === 'function' ? fxHueOf('stars') : null;
+    const COL = { c: sHue === null ? ACCENT_RGB : _fxHSL(sHue).join(','),
+      v: '175,150,255', w: '212,230,242' };
     const still = s.motionLevel === 'off';   // Settings → Effects → Motion OFF freezes drift/twinkle
     if (s.stars) {
-      const bright = s.starBrightness || 1;
+      const P = fxp('stars'), bright = s.starBrightness || 1;
+      // depth parallax: near stars (high z) shift more than distant ones, so the field
+      // gains a sense of depth as the cursor passes rather than moving as a flat sheet
+      const SM = typeof fxMouse === 'function' ? fxMouse('stars') : null;
       for (const st of stars) {
-        if (!still) st.x -= st.z * 0.10;
+        if (!still) st.x -= st.z * 0.10 * P.drift;
         if (st.x < 0) { st.x = c.width; st.y = Math.random() * c.height; }
-        let a = (0.20 + 0.62 * st.z * (0.55 + 0.45 * Math.sin((still ? 0 : t) / 850 + st.tw))) * bright;
+        if (SM) {
+          const mf = fxMouseAt(SM, st.x + (st.ox || 0), st.y + (st.oy || 0));
+          springStep(st, mf.fx * st.z * 1.6, mf.fy * st.z * 1.6, 0.06, 0.9, 120);
+        } else if (st.ox) springStep(st, 0, 0, 0.06, 0.9, 120);
+        let a = (0.20 + 0.62 * st.z * (0.55 + 0.45 * Math.sin((still ? 0 : t) / 850 * P.twinkle + st.tw))) * bright;
         a = Math.min(1, a);
         const col = COL[st.hue];
         if (s.glow && st.z > 0.8) { ctx.shadowBlur = 6; ctx.shadowColor = `rgba(${col},${a})`; }
         else ctx.shadowBlur = 0;
         const size = st.z > 0.82 ? 2.1 : st.z > 0.5 ? 1.4 : 0.9;
         ctx.fillStyle = `rgba(${col},${a.toFixed(3)})`;
-        ctx.beginPath(); ctx.arc(st.x, st.y, size, 0, 6.283); ctx.fill();
+        ctx.beginPath(); ctx.arc(st.x + (st.ox || 0), st.y + (st.oy || 0), size, 0, 6.283); ctx.fill();
       }
       ctx.shadowBlur = 0;
     }
     if (s.shootingStars && !still) {
-      if (shooters.length < 2 && Math.random() < 0.005) {
+      // speed and trail are applied per frame, not baked in at spawn, so dragging either
+      // slider changes the streaks already crossing rather than only the next one
+      const S = fxp('shootingStars');
+      if (shooters.length < S.maxOn && Math.random() < 0.005 * S.rate) {
         shooters.push({ x: Math.random() * c.width, y: Math.random() * c.height * 0.55,
           vx: -(5 + Math.random() * 5), vy: 2 + Math.random() * 2.5, life: 1 });
       }
       for (const sh of shooters) {
-        sh.x += sh.vx; sh.y += sh.vy; sh.life -= 0.018;
-        const g = ctx.createLinearGradient(sh.x, sh.y, sh.x - sh.vx * 9, sh.y - sh.vy * 9);
+        sh.x += sh.vx * S.speed; sh.y += sh.vy * S.speed; sh.life -= 0.018;
+        const tx = sh.x - sh.vx * 9 * S.trail, ty = sh.y - sh.vy * 9 * S.trail;
+        const g = ctx.createLinearGradient(sh.x, sh.y, tx, ty);
         g.addColorStop(0, `rgba(150,240,255,${Math.max(0, sh.life)})`);
         g.addColorStop(1, 'rgba(150,240,255,0)');
         ctx.strokeStyle = g; ctx.lineWidth = 2; ctx.lineCap = 'round';
-        ctx.beginPath(); ctx.moveTo(sh.x, sh.y); ctx.lineTo(sh.x - sh.vx * 9, sh.y - sh.vy * 9); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(sh.x, sh.y); ctx.lineTo(tx, ty); ctx.stroke();
       }
       shooters = shooters.filter(sh => sh.life > 0 && sh.x > -80);
     } else if (shooters.length) shooters = [];
@@ -2937,6 +3178,7 @@ function startClock() {
 // renders, and the value the draw function reads. Adding a knob is one line here.
 //   num  {k,label,min,max,step,def,fmt}      opt {k,label,opts:[[val,label]],def}
 const X1 = v => v.toFixed(1) + '×', X2 = v => v.toFixed(2) + '×', PCT = v => Math.round(v * 100) + '%';
+const PX = v => v + 'px', SEC = v => v + 's';
 const FX_SPECS = {
   deepNebula: [
     { k: 'clouds', label: 'Clouds', min: 2, max: 12, step: 1, def: 5, fmt: v => v },
@@ -2966,11 +3208,109 @@ const FX_SPECS = {
     { k: 'palette', label: 'Palette', def: 'classic',
       opts: [['classic', 'Classic green'], ['solar', 'Solar storm'], ['arctic', 'Arctic'], ['accent', 'Accent']] },
   ],
-  constellations: [
-    { k: 'nodes', label: 'Stars', min: 15, max: 160, step: 5, def: 60, fmt: v => v },
-    { k: 'link', label: 'Link range', min: 60, max: 320, step: 10, def: 170, fmt: v => v + 'px' },
-    { k: 'speed', label: 'Drift', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
+  // --- always-on layers. `top: true` marks a param whose value lives as a TOP-LEVEL
+  // setting instead of under fxp[effect], because FX_PRESETS names it and
+  // Settings.apply() reads it. Only where it is DRAWN moved: into this panel.
+  stars: [
+    { k: 'starDensity', label: 'Density', min: 0.4, max: 3, step: 0.1, def: 1.5, fmt: X1, top: true },
+    { k: 'starBrightness', label: 'Brightness', min: 0.6, max: 2.4, step: 0.1, def: 1.4, fmt: X1, top: true },
+    { k: 'drift', label: 'Drift', min: 0, max: 4, step: 0.1, def: 1, fmt: X1 },
+    { k: 'twinkle', label: 'Twinkle', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
+  ],
+  shootingStars: [
+    { k: 'rate', label: 'How often', min: 0.2, max: 6, step: 0.2, def: 1, fmt: X1 },
+    { k: 'maxOn', label: 'At once', min: 1, max: 6, step: 1, def: 2, fmt: v => v },
+    { k: 'speed', label: 'Speed', min: 0.3, max: 3, step: 0.1, def: 1, fmt: X1 },
+    { k: 'trail', label: 'Trail length', min: 0.4, max: 3, step: 0.1, def: 1, fmt: X1 },
+  ],
+  nebula: [
+    { k: 'a', label: 'Opacity', min: 0.05, max: 1.4, step: 0.05, def: 0.55, fmt: PCT },
+    { k: 'blur', label: 'Softness', min: 0, max: 60, step: 2, def: 22, fmt: PX },
+    { k: 'secs', label: 'Drift cycle', min: 8, max: 120, step: 2, def: 44, fmt: SEC },
+  ],
+  horizon: [
+    { k: 'h', label: 'Height', min: 12, max: 80, step: 2, def: 42, fmt: v => v + 'vh' },
+    { k: 'gap', label: 'Grid spacing', min: 16, max: 160, step: 4, def: 72, fmt: PX },
+    { k: 'tilt', label: 'Tilt', min: 30, max: 80, step: 1, def: 58, fmt: v => v + '°' },
+    { k: 'a', label: 'Opacity', min: 0.1, max: 2, step: 0.05, def: 1, fmt: PCT },
+  ],
+  glow: [
+    { k: 'glowLevel', label: 'Window glow', min: 0, max: 2, step: 0.05, def: 1, fmt: X2, top: true },
+  ],
+  scanlines: [
+    { k: 'a', label: 'Opacity', min: 0.01, max: 0.3, step: 0.01, def: 0.05, fmt: PCT },
+    { k: 'pitch', label: 'Line spacing', min: 2, max: 12, step: 1, def: 3, fmt: PX },
+  ],
+  vignette: [
+    { k: 'a', label: 'Strength', min: 0.1, max: 2, step: 0.05, def: 1, fmt: PCT },
+    { k: 'size', label: 'Clear centre', min: 10, max: 85, step: 5, def: 55, fmt: v => v + '%' },
+  ],
+  grain: [
+    { k: 'a', label: 'Opacity', min: 0.01, max: 0.25, step: 0.01, def: 0.05, fmt: PCT },
+    { k: 'secs', label: 'Sizzle', min: 0.1, max: 2, step: 0.05, def: 0.5, fmt: SEC },
+  ],
+  sweep: [
+    { k: 'secs', label: 'Every', min: 2, max: 30, step: 1, def: 7, fmt: SEC },
+    { k: 'h', label: 'Band height', min: 20, max: 400, step: 10, def: 120, fmt: PX },
+    { k: 'a', label: 'Brightness', min: 0.2, max: 3, step: 0.1, def: 1, fmt: PCT },
+  ],
+  flicker: [
+    { k: 'secs', label: 'Every', min: 1, max: 30, step: 0.5, def: 5.5, fmt: SEC },
+    { k: 'strength', label: 'Strength', min: 0.2, max: 4, step: 0.1, def: 1, fmt: X1 },
+  ],
+  hud: [
+    { k: 'sz', label: 'Bracket size', min: 12, max: 90, step: 2, def: 34, fmt: PX },
+    { k: 'w', label: 'Line weight', min: 0.5, max: 5, step: 0.5, def: 1.5, fmt: PX },
+    { k: 'a', label: 'Opacity', min: 0.2, max: 2.4, step: 0.1, def: 1, fmt: PCT },
+    { k: 'secs', label: 'Pulse', min: 0.6, max: 12, step: 0.2, def: 3.4, fmt: SEC },
+  ],
+  glitch: [
+    { k: 'secs', label: 'Every', min: 1, max: 40, step: 1, def: 9, fmt: SEC },
+    { k: 'strength', label: 'Strength', min: 0.2, max: 6, step: 0.2, def: 1, fmt: X1 },
+  ],
+  lavaLamp: [
+    { k: 'nodes', label: 'Blobs', min: 10, max: 220, step: 2, def: 34, fmt: v => v },
+    { k: 'dir', label: 'Gravity', def: 'down',
+      opts: [['down', 'Down'], ['up', 'Up'], ['left', 'Left'], ['right', 'Right']] },
+    { k: 'link', label: 'Reach', min: 60, max: 280, step: 10, def: 130, fmt: v => v + 'px' },
+    { k: 'clump', label: 'Lift threshold', min: 2, max: 12, step: 1, def: 5, fmt: v => v + ' near' },
+    { k: 'fall', label: 'Fall speed', min: 0.1, max: 3, step: 0.1, def: 1, fmt: X1 },
+    { k: 'rise', label: 'Rise speed', min: 0.2, max: 3, step: 0.1, def: 1, fmt: X1 },
+    // same meaning as the constellations knob: a master rate for the whole lamp, scaling
+    // the step rather than any one force, so the balance between them is unchanged
+    { k: 'drift', label: 'Drift', min: 0, max: 4, step: 0.1, def: 1, fmt: X1 },
+    { k: 'cohesion', label: 'Cohesion', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
+    // The two ends of the same force, separately. Both at 1.0 reproduce the single-knob
+    // behaviour exactly, so an existing lamp is unchanged until one of them is moved.
+    { k: 'gather', label: 'Attraction at gravity end', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
+    { k: 'scatter', label: 'Repulsion at far end', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
+    { k: 'blob', label: 'Blob size', min: 0.4, max: 3, step: 0.1, def: 1, fmt: X2 },
     { k: 'opacity', label: 'Opacity', min: 0.2, max: 2, step: 0.05, def: 1, fmt: X2 },
+    { k: 'cold', label: 'Cold colour', type: 'color', def: '#2f6bff' },
+    { k: 'hot', label: 'Hot colour', type: 'color', def: '#ff5d3c' },
+  ],
+  constellations: [
+    { k: 'nodes', label: 'Stars', min: 15, max: 1000, step: 5, def: 60, fmt: v => v },
+    { k: 'link', label: 'Link range', min: 60, max: 600, step: 10, def: 170, fmt: v => v + 'px' },
+    { k: 'speed', label: 'Drift', min: 0, max: 10, step: 0.1, def: 1, fmt: X1 },
+    { k: 'opacity', label: 'Opacity', min: 0.2, max: 2, step: 0.05, def: 1, fmt: X2 },
+    { k: 'grav', label: 'Gravity', def: 'off', opts: [['off', 'Off'], ['on', 'On']] },
+    // the old 0.1-6 range put every visible difference in its first fifth; measured
+    // spread runs 651px at 0.02 down to ~60px at 1.5, smoothly across the whole travel
+    { k: 'gstr', label: 'Gravity strength', min: 0.02, max: 1.5, step: 0.02, def: 0.3, fmt: X2,
+      when: v => v('grav') === 'on' },
+    { k: 'anti', label: 'Anti-gravity share', min: 0, max: 1, step: 0.05, def: 0, fmt: PCT,
+      when: v => v('grav') === 'on' },
+    { k: 'osc', label: 'Oscillating share', min: 0, max: 1, step: 0.05, def: 0, fmt: PCT,
+      when: v => v('grav') === 'on' },
+    { k: 'oscHz', label: 'Oscillation rate', min: 0.01, max: 1, step: 0.01, def: 0.12, fmt: n => n.toFixed(2) + 'Hz',
+      when: v => v('grav') === 'on' && v('osc') > 0 },
+    { k: 'mass', label: 'Mass', def: 'uniform', when: v => v('grav') === 'on',
+      opts: [['uniform', 'Equal'], ['random', 'Random'], ['split', 'Heavy few']] },
+    { k: 'massMax', label: 'Mass spread', min: 1.5, max: 40, step: 0.5, def: 8, fmt: X1,
+      when: v => v('grav') === 'on' && v('mass') !== 'uniform' },
+    { k: 'massPct', label: 'Heavy share', min: 0.02, max: 0.5, step: 0.02, def: 0.1, fmt: PCT,
+      when: v => v('grav') === 'on' && v('mass') === 'split' },
   ],
   codeRain: [
     { k: 'density', label: 'Columns', min: 0.3, max: 2.5, step: 0.1, def: 1, fmt: X1 },
@@ -2993,6 +3333,25 @@ const FX_SPECS = {
     { k: 'pos', label: 'Position', def: 'bl',
       opts: [['bl', 'Bottom left'], ['br', 'Bottom right'], ['tl', 'Top left'], ['c', 'Centre']] },
   ],
+  // The cursor is not an effect with a toggle of its own, but it has parameters like one,
+  // so it rides the same FX_SPECS/fxp machinery and gets a panel for free.
+  mouse: [
+    { k: 'on', label: 'Cursor field', def: 'off', opts: [['off', 'Off'], ['on', 'On']] },
+    { k: 'mode', label: 'Acts as', def: 'push', when: v => v('on') === 'on',
+      opts: [['push', 'Push away'], ['pull', 'Pull in'], ['swirl', 'Swirl'], ['drag', 'Drag along']] },
+    { k: 'radius', label: 'Reach', min: 40, max: 700, step: 10, def: 200, fmt: PX,
+      when: v => v('on') === 'on' },
+    { k: 'strength', label: 'Strength', min: 0.1, max: 6, step: 0.1, def: 1, fmt: X1,
+      when: v => v('on') === 'on' },
+    { k: 'trail', label: 'Trail', def: 'off',
+      opts: [['off', 'None'], ['sparkle', 'Sparkles'], ['smoke', 'Smoke'], ['flame', 'Flame'], ['ribbon', 'Ribbon']] },
+    { k: 'trailCol', label: 'Trail colour', def: 'accent', when: v => v('trail') !== 'off',
+      opts: [['accent', 'Accent'], ['warm', 'Warm'], ['cool', 'Cool'], ['rainbow', 'Rainbow']] },
+    { k: 'trailSize', label: 'Trail size', min: 0.3, max: 4, step: 0.1, def: 1, fmt: X1,
+      when: v => v('trail') !== 'off' },
+    { k: 'trailLayer', label: 'Trail layer', def: 'fore', when: v => v('trail') !== 'off',
+      opts: [['fore', 'Over windows'], ['back', 'Behind windows'], ['both', 'Both']] },
+  ],
   flybys: [
     { k: 'rate', label: 'How often', min: 0.25, max: 6, step: 0.25, def: 1, fmt: X1 },
     { k: 'scale', label: 'Size', min: 0.4, max: 3, step: 0.1, def: 1, fmt: X2 },
@@ -3003,12 +3362,94 @@ const FX_SPECS = {
     { k: 'maxOn', label: 'At once', min: 1, max: 6, step: 1, def: 3, fmt: v => v },
   ],
 };
+/* Controls every effect shares. Appended in a loop rather than written out twenty times:
+   the duplication is what would rot, and a spec that drifted would be invisible until
+   someone opened that one panel. MOUSE_AWARE lists the effects that actually respond to
+   the cursor — offering the toggle on an effect that ignores it would be a lie. */
+const MOUSE_AWARE = new Set(['stars', 'constellations', 'codeRain', 'radar', 'circuit',
+  'deepNebula', 'solarSystem', 'aurora', 'flybys']);
+/* Colour is only OFFERED where it actually lands. A per-effect hue reaches the canvas
+   through _fxRGB(), which most effects use but several do not: the CSS-driven layers take
+   var(--acc) from the stylesheet, the lava lamp has its own cold/hot pair, and the flyby
+   cast is mostly hand-coloured sprites. Offering the control everywhere meant a Colour
+   knob that silently did nothing on more effects than it worked on. Same rule as
+   MOUSE_AWARE, and fx-vars.test.mjs pins this set against the effects that really use
+   _fxRGB so the two cannot drift. */
+const COLOUR_AWARE = new Set(['stars', 'constellations', 'codeRain', 'radar', 'circuit',
+  'deepNebula', 'solarSystem', 'aurora']);
+for (const [key, spec] of Object.entries(FX_SPECS)) {
+  if (key === 'mouse') continue;                     // the cursor does not act on itself
+  if (COLOUR_AWARE.has(key)) {
+    spec.push({ k: 'col', label: 'Colour', def: 'global',
+      opts: [['global', 'Global (theme)'], ['custom', 'Custom']] });
+    spec.push({ k: 'hue', label: 'Hue', min: 0, max: 360, step: 5, def: 190, fmt: n => n + '°',
+      when: v => v('col') === 'custom' });
+  }
+  if (MOUSE_AWARE.has(key)) {
+    spec.push({ k: 'mouse', label: 'Cursor interaction', def: 'off',
+      opts: [['off', 'Off'], ['on', 'On']] });
+  }
+}
+
+/* One cursor force for a point, already resolved against the global cursor settings and
+   this effect's opt-in. Returns null — not a zero vector — when nothing should happen, so
+   callers can skip their whole perturbation branch rather than adding zeroes every frame.
+   The force fades out as the pointer goes idle, so a parked cursor stops holding things. */
+function fxMouse(key) {
+  const M = fxp('mouse');
+  if (M.on !== 'on' || !Pointer.inside) return null;
+  if (key && fxp(key).mouse !== 'on') return null;
+  const fade = Math.max(0, 1 - Pointer.idle / 1.5);   // gone 1.5s after the cursor stops
+  if (fade <= 0) return null;
+  return { x: Pointer.x, y: Pointer.y, r: M.radius, mode: M.mode,
+    s: M.strength * fade, vx: Pointer.vx, vy: Pointer.vy };
+}
+// Force on one point from that resolved cursor, as {fx, fy}. 'drag' carries the point
+// along with the cursor's own motion instead of pushing relative to its position.
+function fxMouseAt(M, x, y) {
+  const f = pointerForce(M.x, M.y, x, y, M.r, M.mode, M.s);
+  if (M.mode === 'drag') return { fx: M.vx * (f.drag || 0) * 0.5, fy: M.vy * (f.drag || 0) * 0.5 };
+  return f;
+}
+
 // resolved params for one effect: spec defaults with the user's overrides on top
 function fxp(key) {
-  const saved = (Settings.load().fxp || {})[key] || {};
+  const s = Settings.load();
+  const saved = (s.fxp || {})[key] || {};
   const out = {};
-  for (const p of FX_SPECS[key] || []) out[p.k] = saved[p.k] !== undefined ? saved[p.k] : p.def;
+  for (const p of FX_SPECS[key] || []) {
+    // a `top` param is stored at the top level (FX_PRESETS names it), so read it from
+    // there — resolving it out of fxp would silently hand back the default forever
+    const v = p.top ? s[p.k] : saved[p.k];
+    out[p.k] = v !== undefined ? v : p.def;
+  }
   return out;
+}
+
+/* The CSS-driven effects (nebula, horizon, scanlines, vignette, grain, sweep, flicker,
+   hud, glitch) have no draw function to read fxp() from, so their params reach the page
+   as custom properties instead. Every rule in index.html carries its original constant
+   as the var's fallback, which means an install that has never opened these panels
+   renders byte-identically to before — and a param set back to its default writes the
+   same number the fallback would have supplied. */
+function applyFXVars() {
+  const r = document.documentElement.style;
+  const num = (k, v) => r.setProperty(k, String(v));
+  const unit = (k, v, u) => r.setProperty(k, v + u);
+  const neb = fxp('nebula'), hor = fxp('horizon'), scn = fxp('scanlines'), vig = fxp('vignette');
+  const grn = fxp('grain'), swp = fxp('sweep'), flk = fxp('flicker'), hud = fxp('hud'), gl = fxp('glitch');
+  num('--neb-a', neb.a); unit('--neb-blur', neb.blur, 'px'); unit('--neb-t', neb.secs, 's');
+  unit('--hor-h', hor.h, 'vh'); unit('--hor-gap', hor.gap, 'px');
+  unit('--hor-gap2', Math.max(4, Math.round(hor.gap * 46 / 72)), 'px');   // hold the original 72:46 ratio
+  unit('--hor-tilt', hor.tilt, 'deg'); num('--hor-a', hor.a);
+  num('--scan-a', scn.a); unit('--scan-pitch', scn.pitch, 'px');
+  num('--vig-a', vig.a); unit('--vig-size', vig.size, '%');
+  num('--grain-a', grn.a); unit('--grain-t', grn.secs, 's');
+  unit('--sweep-h', swp.h, 'px'); unit('--sweep-t', swp.secs, 's'); num('--sweep-a', swp.a);
+  unit('--flick-t', flk.secs, 's'); num('--flick-s', flk.strength);
+  unit('--hud-sz', hud.sz, 'px'); unit('--hud-w', hud.w, 'px');
+  num('--hud-a', hud.a); unit('--hud-t', hud.secs, 's');
+  unit('--glitch-t', gl.secs, 's'); num('--glitch-s', gl.strength);
 }
 
 // cheap 1-D value noise + fbm. Used for aurora ray structure and nebula shape —
@@ -3026,10 +3467,25 @@ const FX_BACK = {};
 // window while a nebula never does.
 const FX_FORE = {};
 
-function _fxRGB(mix) {          // accent, optionally pulled toward white
-  const [r, g, b] = ACCENT_RGB.split(',').map(Number);
+/* Per-effect colour. The frame loop parks the current effect's hue here before calling
+   its draw function, so every _fxRGB() call inside that effect picks it up without a
+   single draw site having to learn about colour settings. null = follow the theme accent,
+   which is both the default and exactly the old behaviour. */
+let _fxHue = null;
+function _fxHSL(hue) {   // a saturated colour at `hue`, near the accent's own lightness
+  const h = ((hue % 360) + 360) % 360 / 60, c = 0.62, x = c * (1 - Math.abs(h % 2 - 1)), m = 0.38;
+  const seg = [[c, x, 0], [x, c, 0], [0, c, x], [0, x, c], [x, 0, c], [c, 0, x]][Math.floor(h) % 6];
+  return seg.map(v => Math.round((v + m) * 255));
+}
+function _fxRGB(mix) {          // accent (or the effect's own hue), optionally toward white
+  const [r, g, b] = _fxHue === null ? ACCENT_RGB.split(',').map(Number) : _fxHSL(_fxHue);
   const m = mix || 0;
   return `${Math.round(r + (255 - r) * m)},${Math.round(g + (255 - g) * m)},${Math.round(b + (255 - b) * m)}`;
+}
+// Resolved hue for one effect: null when it follows the global accent.
+function fxHueOf(key) {
+  const P = (Settings.load().fxp || {})[key] || {};
+  return P.col === 'custom' ? (P.hue !== undefined ? P.hue : 190) : null;
 }
 
 /* --- distant nebulae -----------------------------------------------------------
@@ -3058,10 +3514,18 @@ FX_BACK.deepNebula = (x, w, h, t, a) => {
   const pal = P.palette === 'accent' ? null : (NEB_PAL[P.palette] || NEB_PAL.deep);
   const A = 0.16 * a * P.opacity;
   x.save(); x.globalCompositeOperation = 'lighter';
+  // the clouds have a fixed anchor plus a sine wobble, so the cursor displaces the whole
+  // cloud and it drifts back — the gas parts around the pointer like smoke
+  const NM = fxMouse('deepNebula');
   for (const s of _nebSeeds) {
     const col = pal ? pal[s.i % pal.length] : _fxRGB(0.1 + (s.i % 3) * 0.12);
-    const cx = (s.x + Math.sin(t * s.sp * P.drift + s.ph) * 0.06) * w;
-    const cy = (s.y + Math.cos(t * s.sp * 0.7 * P.drift + s.ph) * 0.04) * h;
+    let cx = (s.x + Math.sin(t * s.sp * P.drift + s.ph) * 0.06) * w;
+    let cy = (s.y + Math.cos(t * s.sp * 0.7 * P.drift + s.ph) * 0.04) * h;
+    if (NM) {
+      const mf = fxMouseAt(NM, cx + (s.ox || 0), cy + (s.oy || 0));
+      springStep(s, mf.fx * 2.4, mf.fy * 2.4, 0.03, 0.93, Math.min(w, h) * 0.5);
+    } else if (s.ox) springStep(s, 0, 0, 0.03, 0.93, Math.min(w, h) * 0.5);
+    cx += s.ox || 0; cy += s.oy || 0;
     const R = s.r * Math.min(w, h) * P.size;
     for (const L of s.lobes) {
       const lx = cx + L.dx * R * 0.55, ly = cy + L.dy * R * 0.55, lr = R * L.s;
@@ -3103,8 +3567,10 @@ const AURORA_PAL = {                    // [hem, low, mid, high]
   arctic: ['120,160,255', '120,255,235', '150,220,255', '190,140,255'],
   accent: null,
 };
-FX_BACK.aurora = (x, w, h, t, a) => {
+const _auroraOff = [];   // per-curtain spring displacement; the curtains are otherwise
+FX_BACK.aurora = (x, w, h, t, a) => {   // a pure function of t with nothing to push
   const P = fxp('aurora');
+  const AM = fxMouse('aurora');
   let pal = AURORA_PAL[P.palette];
   if (!pal) { const c = _fxRGB(0); pal = [_fxRGB(0.45), c, _fxRGB(0.2), _fxRGB(0.6)]; }
   const bri = P.brightness * a, step = 4;
@@ -3115,9 +3581,17 @@ FX_BACK.aurora = (x, w, h, t, a) => {
     const yBase = h * (P.top + c * 0.05);
     const H = h * P.height * (0.55 + 0.45 * depth);
     const ph = c * 2.7 + 1.3;
+    // the curtain is drawn column by column from a closed form, so the cursor displaces
+    // the whole sheet and it sways back -- you part the ribbon rather than dent it
+    const slot = _auroraOff[c] || (_auroraOff[c] = {});
+    if (AM) {
+      const mf = fxMouseAt(AM, w * 0.5 + (slot.ox || 0), yBase - H * 0.5 + (slot.oy || 0));
+      springStep(slot, mf.fx * 2.2, mf.fy * 2.2, 0.035, 0.92, h * 0.3);
+    } else if (slot.ox) springStep(slot, 0, 0, 0.035, 0.92, h * 0.3);
+    const sx = slot.ox || 0, sy = slot.oy || 0;
     // one ramp per curtain; per-column bend shifts it by <4% of h, which is invisible
     // against a gradient this soft and buys ~640 fewer gradient allocations a frame.
-    const g = x.createLinearGradient(0, yBase, 0, yBase - H);
+    const g = x.createLinearGradient(0, yBase + sy, 0, yBase + sy - H);
     g.addColorStop(0.00, `rgba(${pal[0]},0)`);
     g.addColorStop(0.04, `rgba(${pal[0]},${0.30 * bri})`);   // violet hem, sharp bottom
     g.addColorStop(0.13, `rgba(${pal[1]},${0.50 * bri})`);   // brightest green band
@@ -3135,7 +3609,7 @@ FX_BACK.aurora = (x, w, h, t, a) => {
       n = Math.pow(Math.max(0, n * 1.7 - 0.25), 1.7);
       if (n < 0.015) continue;
       x.globalAlpha = Math.min(1, n) * depth;
-      x.fillRect(px, yBase + bend - H, step + 1, H);
+      x.fillRect(px + sx, yBase + sy + bend - H, step + 1, H);
     }
     x.globalAlpha = 1;
   }
@@ -3155,10 +3629,12 @@ const _PLANETS = [
   { d: 0.47, r: 5.5, sp: 0.13, e: 0.08, c: '225,210,165', ring: true },
   { d: 0.57, r: 4.0, sp: 0.09, e: 0.05, c: '150,225,240' },
 ];
+const _planetOff = [];   // per-planet spring displacement; see the cursor branch below
 FX_BACK.solarSystem = (x, w, h, t, a) => {
   const P = fxp('solarSystem');
   const POS = { br: [0.80, 0.72], bl: [0.20, 0.72], tr: [0.80, 0.30], c: [0.50, 0.50] }[P.pos] || [0.80, 0.72];
   const cx = w * POS[0], cy = h * POS[1], R = Math.min(w, h) * 0.62 * P.size;
+  const SM = fxMouse('solarSystem');
   const A = a * P.opacity, tilt = 0.42, sun = _fxRGB(0.35);
   x.save(); x.globalCompositeOperation = 'lighter';
   const g = x.createRadialGradient(cx, cy, 0, cx, cy, R * 0.16);
@@ -3177,7 +3653,16 @@ FX_BACK.solarSystem = (x, w, h, t, a) => {
       x.beginPath(); x.ellipse(cx - fx, cy, rx, ry, 0, 0, 7); x.stroke();
     }
     const ang = t * p.sp * 0.28 * P.speed + p.d * 19;
-    const px = cx - fx + Math.cos(ang) * rx, py = cy + Math.sin(ang) * ry;
+    // orbits are closed-form in t, so a planet cannot be "pushed" without leaving its
+    // orbit forever. A spring displacement lets the cursor drag it off the ellipse and
+    // have it fall back into place — perturbing the orbit without breaking it.
+    const ox0 = cx - fx + Math.cos(ang) * rx, oy0 = cy + Math.sin(ang) * ry;
+    const slot = _planetOff[i] || (_planetOff[i] = {});
+    if (SM) {
+      const mf = fxMouseAt(SM, ox0 + (slot.ox || 0), oy0 + (slot.oy || 0));
+      springStep(slot, mf.fx * 1.8, mf.fy * 1.8, 0.045, 0.9, R * 0.6);
+    } else if (slot.ox) springStep(slot, 0, 0, 0.045, 0.9, R * 0.6);
+    const px = ox0 + (slot.ox || 0), py = oy0 + (slot.oy || 0);
     const pr = p.r * P.size;
     if (p.ring) {
       x.strokeStyle = `rgba(${p.c},${0.45 * A})`; x.lineWidth = 1.5 * P.size;
@@ -3202,36 +3687,216 @@ FX_BACK.solarSystem = (x, w, h, t, a) => {
   }
 };
 
-/* --- constellations: drifting nodes that wire up when they get close --- */
-let _cNodes = null, _cN = null;
+/* --- constellations: drifting nodes that wire up when they get close ---------------
+   Node count is the expensive dial: candidate pairs grow as its square, and at the top
+   of the range that is hundreds of thousands per frame. Two things pay for it. The pair
+   search goes through eachLinkedPair, which buckets nodes into link-sized cells and so
+   only tests neighbours. And every line and dot is accumulated into one of CBANDS
+   Path2Ds keyed by brightness, so a frame costs a fixed handful of strokes instead of
+   one draw — plus one rgba() string build and parse — per line. That string parse, not
+   the geometry, is what made the old one-stroke-per-line loop fall over. */
+const CBANDS = 8;
+let _cNodes = null;
 FX_BACK.constellations = (x, w, h, t, a) => {
   const P = fxp('constellations');
-  if (!_cNodes || _cNodes._w !== w || _cN !== P.nodes) {
-    _cNodes = Array.from({ length: P.nodes }, () => ({
-      x: Math.random() * w, y: Math.random() * h, m: 0.5 + Math.random() * 1.4,
+  if (!_cNodes || _cNodes._w !== w || _cNodes._h !== h) { _cNodes = []; _cNodes._w = w; _cNodes._h = h; }
+  // grow and shrink in place: dragging 'Stars' must add or drop nodes, not teleport the
+  // ones already on screen to fresh random spots on every step of the slider
+  while (_cNodes.length < P.nodes) {
+    _cNodes.push({ x: Math.random() * w, y: Math.random() * h, m: 0.5 + Math.random() * 1.4,
       tw: Math.random() * 6.283,
-      vx: (Math.random() - 0.5) * 0.16, vy: (Math.random() - 0.5) * 0.16 }));
-    _cNodes._w = w; _cN = P.nodes;
+      // fixed ranks: r picks anti-gravity, r2 picks oscillators, r3 picks mass, ph is the
+      // oscillator's phase so they do not all swing in lockstep
+      r: Math.random(), r2: Math.random(), r3: Math.random(), ph: Math.random() * 6.283,
+      gm: 1, vx: (Math.random() - 0.5) * 0.16, vy: (Math.random() - 0.5) * 0.16 });
   }
+  if (_cNodes.length > P.nodes) _cNodes.length = P.nodes;
+
   const rgb = _fxRGB(0.1), LINK = P.link, A = a * P.opacity;
+  if (P.grav === 'on') {
+    // Every node holds FIXED random ranks (r, r2, ph). Which nodes are anti-gravity,
+    // which oscillate and which are heavy is decided by comparing a rank against the
+    // relevant share, so dragging a share converts nodes a few at a time. Re-rolling per
+    // frame would reshuffle the whole field on every step of the slider instead.
+    const osc = P.osc, anti = P.anti, w2 = 6.283 * P.oscHz * t;
+    for (const p of _cNodes) {
+      // oscillators swing smoothly through zero, so influence fades out and returns
+      // inverted rather than snapping; |g| scales the force inside stepGravity
+      p.g = p.r2 < osc ? Math.sin(w2 + p.ph) : (p.r < anti ? -1 : 1);
+      p.gm = P.mass === 'random' ? 1 + p.r3 * (P.massMax - 1)
+        : P.mass === 'split' ? (p.r3 < P.massPct ? P.massMax : 1)
+          : 1;
+    }
+    // 40 / 0.99 / 6 are tuned together, not free knobs. Push the effective strength much
+    // past this and the infall outruns what the damping can bleed off in a frame: the
+    // cluster virialises into a hot gas and MORE gravity reads as LESS blob. The slider
+    // ceiling is set to stay inside that; see constellation-gravity.test.mjs.
+    stepGravity(_cNodes, P.gstr * 40, 0.99, 6);
+  }
+  // constellations integrate a velocity already, so the cursor is just one more force
+  const CM = fxMouse('constellations');
+  if (CM) {
+    for (const p of _cNodes) {
+      const f = fxMouseAt(CM, p.x, p.y);
+      p.vx += f.fx * 0.5; p.vy += f.fy * 0.5;
+    }
+  }
   for (const p of _cNodes) {
     p.x += p.vx * P.speed; p.y += p.vy * P.speed;
-    if (p.x < 0 || p.x > w) p.vx *= -1;
-    if (p.y < 0 || p.y > h) p.vy *= -1;
+    // reflect off the edges rather than just flipping the sign: under gravity a node can
+    // arrive fast enough to land well outside, and a bare flip would leave it stuck there
+    // oscillating off-screen for as long as the force kept pointing outwards
+    if (p.x < 0) { p.x = 0; p.vx = Math.abs(p.vx); }
+    else if (p.x > w) { p.x = w; p.vx = -Math.abs(p.vx); }
+    if (p.y < 0) { p.y = 0; p.vy = Math.abs(p.vy); }
+    else if (p.y > h) { p.y = h; p.vy = -Math.abs(p.vy); }
   }
+  const lines = [], dots = [];
+  for (let b = 0; b < CBANDS; b++) { lines.push(new Path2D()); dots.push(new Path2D()); }
+  eachLinkedPair(_cNodes, LINK, w, h, (p, q, d) => {
+    const f = Math.pow(1 - d / LINK, 1.6);            // same falloff as before, quantised
+    const b = Math.min(CBANDS - 1, (f * CBANDS) | 0);
+    lines[b].moveTo(p.x, p.y); lines[b].lineTo(q.x, q.y);
+  });
   x.lineWidth = 1;
-  for (let i = 0; i < _cNodes.length; i++) {
-    const p = _cNodes[i];
-    for (let j = i + 1; j < _cNodes.length; j++) {
-      const q = _cNodes[j], d = Math.hypot(p.x - q.x, p.y - q.y);
-      if (d > LINK) continue;
-      x.strokeStyle = `rgba(${rgb},${Math.pow(1 - d / LINK, 1.6) * 0.24 * A})`;
+  for (let b = 0; b < CBANDS; b++) {
+    x.strokeStyle = `rgba(${rgb},${((b + 0.5) / CBANDS) * 0.24 * A})`;
+    x.stroke(lines[b]);
+  }
+  for (const p of _cNodes) {
+    const tw = 0.72 + 0.28 * Math.sin(t * 1.7 + p.tw);   // 0.44 .. 1.00
+    const b = Math.min(CBANDS - 1, Math.max(0, ((tw - 0.44) / 0.56 * CBANDS) | 0));
+    // sqrt so a 40x mass reads as ~6x the radius rather than a disc that eats the screen
+    const rad = p.gm > 1 ? p.m * Math.sqrt(p.gm) : p.m;
+    dots[b].moveTo(p.x + rad, p.y);                      // moveTo first, else the arcs join up
+    dots[b].arc(p.x, p.y, rad, 0, 7);
+  }
+  for (let b = 0; b < CBANDS; b++) {
+    x.fillStyle = `rgba(${rgb},${0.55 * A * (0.44 + ((b + 0.5) / CBANDS) * 0.56)})`;
+    x.fill(dots[b]);
+  }
+};
+
+/* --- lava lamp -------------------------------------------------------------------
+   Constellation's nodes-and-edges look, driven by thermal convection instead of a
+   random walk. The cycle the user described, and what makes it read as a lava lamp
+   rather than as bouncing dots:
+
+     gather  near the gravity end cohesion is strongest, so blobs pull together
+     rise    a blob with >= `clump` neighbours is buoyant — mass is what lifts it, so
+             a lone blob CANNOT rise and a big clot rises fastest
+     spread  approaching the far end cohesion inverts into separation, the clot breaks
+     fall    fewer neighbours than the threshold, so gravity wins again
+
+   Buoyancy keyed to neighbour COUNT is the whole trick: it makes rise and fall
+   emergent rather than scripted, so blobs merge, lift together, shear apart and drop
+   at their own pace. Colour lerps along the gravity axis, so a blob warms as it climbs
+   and cools on the way back down.
+
+   O(n^2) over the pair list, same as constellations — one pass computes neighbour
+   count, cohesion/separation and the links to draw, so the cost is one sweep not three. */
+const LAVA_DIR = { down: [0, 1], up: [0, -1], left: [-1, 0], right: [1, 0] };
+const LAVA_PIVOT = 0.45;   // where cohesion inverts into separation along the gravity axis
+let _lava = null;
+function _mixHex(a, b, k) {          // k=0 -> a, k=1 -> b
+  const pa = hexRGB(a).split(',').map(Number), pb = hexRGB(b).split(',').map(Number);
+  return pa.map((v, i) => Math.round(v + (pb[i] - v) * k)).join(',');
+}
+FX_BACK.lavaLamp = (x, w, h, t, a) => {
+  const P = fxp('lavaLamp');
+  const G = LAVA_DIR[P.dir] || LAVA_DIR.down;
+  if (!_lava || _lava._w !== w || _lava._h !== h || _lava._n !== P.nodes) {
+    _lava = Array.from({ length: P.nodes }, () => ({
+      x: Math.random() * w, y: Math.random() * h,
+      vx: 0, vy: 0, r: 0.7 + Math.random() * 0.9, seed: Math.random() * 6.283 }));
+    _lava._w = w; _lava._h = h; _lava._n = P.nodes; _lava._t = t;
+  }
+  const dt = Math.min(0.05, t - (_lava._t || t)); _lava._t = t;
+  const L = P.link, L2 = L * L, A = a * P.opacity;
+  // u = 0 at the far (cold) end, 1 at the gravity (hot) end
+  const uOf = p => G[1] ? (G[1] > 0 ? p.y / h : 1 - p.y / h) : (G[0] > 0 ? p.x / w : 1 - p.x / w);
+  const n = _lava.length;
+  const near = new Array(n).fill(0);
+  const fx2 = new Float64Array(n), fy2 = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const p = _lava[i];
+    for (let j = i + 1; j < n; j++) {
+      const q = _lava[j], dx = q.x - p.x, dy = q.y - p.y, d2 = dx * dx + dy * dy;
+      if (d2 > L2 || d2 < 1e-6) continue;
+      const d = Math.sqrt(d2);
+      near[i]++; near[j]++;
+      const u = (uOf(p) + uOf(q)) * 0.5;
+      // Cohesion at the hot end, separation at the cold end — this inversion is what makes
+      // a clot climb, come apart up top, and reform on the way back down. The two ends are
+      // scaled independently: `gather` sets how hard blobs clump where gravity collects
+      // them, `scatter` how hard they break up at the far end. Written so both at 1.0 give
+      // exactly the old `(u - PIVOT)` curve, leaving an existing lamp untouched.
+      const side = u >= LAVA_PIVOT
+        ? P.gather * (1 - LAVA_PIVOT) * (u - LAVA_PIVOT) / (1 - LAVA_PIVOT)
+        : -P.scatter * LAVA_PIVOT * (LAVA_PIVOT - u) / LAVA_PIVOT;
+      let f = P.cohesion * side * 26 * (1 - d / L);
+      if (d < 26) f -= (26 - d) * 1.7;          // hard core so blobs never collapse to a point
+      const ux = dx / d, uy = dy / d;
+      fx2[i] += ux * f; fy2[i] += uy * f;
+      fx2[j] -= ux * f; fy2[j] -= uy * f;
+    }
+  }
+  x.save();
+  x.globalCompositeOperation = 'lighter';
+  // links first, so blobs sit on top of the webbing
+  x.lineWidth = 1;
+  for (let i = 0; i < n; i++) {
+    const p = _lava[i];
+    for (let j = i + 1; j < n; j++) {
+      const q = _lava[j], dx = q.x - p.x, dy = q.y - p.y, d2 = dx * dx + dy * dy;
+      if (d2 > L2) continue;
+      const d = Math.sqrt(d2), u = (uOf(p) + uOf(q)) * 0.5;
+      x.strokeStyle = `rgba(${_mixHex(P.cold, P.hot, u)},${Math.pow(1 - d / L, 1.7) * 0.30 * A})`;
       x.beginPath(); x.moveTo(p.x, p.y); x.lineTo(q.x, q.y); x.stroke();
     }
-    const tw = 0.72 + 0.28 * Math.sin(t * 1.7 + p.tw);
-    x.fillStyle = `rgba(${rgb},${0.55 * A * tw})`;
-    x.beginPath(); x.arc(p.x, p.y, p.m, 0, 7); x.fill();
   }
+  for (let i = 0; i < n; i++) {
+    const p = _lava[i], u = uOf(p);
+    // mass lifts: at/above the threshold buoyancy exceeds gravity and the clot climbs
+    const lift = Math.min(2.2, near[i] / Math.max(1, P.clump));
+    const g = (1 - lift) >= 0 ? (1 - lift) * P.fall : (1 - lift) * P.rise;
+    p.vx += (fx2[i] * 0.02 + G[0] * g * 34) * dt;
+    p.vy += (fy2[i] * 0.02 + G[1] * g * 34) * dt;
+    p.vx += Math.sin(t * 0.5 + p.seed) * 1.2 * dt;      // gentle wander so it never looks gridded
+    p.vx *= 0.94; p.vy *= 0.94;                          // viscosity — lava is not a vacuum
+    p.x += p.vx * P.drift; p.y += p.vy * P.drift;        // master rate; 0 freezes the lamp
+    // Walls along the gravity axis get a CUSHION, not just a clamp. Gravity pushes a lone
+    // blob into the collecting end and buoyancy pushes a big clot into the far one, and a
+    // bare clamp then pins it there: re-clamped every frame, sliding along the edge for as
+    // long as the force points out — which is the "stuck at the top or bottom" that gets
+    // reported. The cushion ramps up over the last stretch and turns a blob around before
+    // it lands, so it settles NEAR the end and drifts back rather than welding to it.
+    // The clamp stays as a backstop. The other pair of walls still wrap.
+    const CM = Math.max(30, (G[1] ? h : w) * 0.13);
+    if (G[1]) {
+      if (p.y < CM) p.vy += (1 - p.y / CM) * 80 * dt;
+      else if (p.y > h - CM) p.vy -= (1 - (h - p.y) / CM) * 80 * dt;
+      if (p.y < 4) { p.y = 4; p.vy = Math.abs(p.vy) * 0.4; }
+      if (p.y > h - 4) { p.y = h - 4; p.vy = -Math.abs(p.vy) * 0.4; }
+      if (p.x < -30) p.x = w + 30; if (p.x > w + 30) p.x = -30;
+    } else {
+      if (p.x < CM) p.vx += (1 - p.x / CM) * 80 * dt;
+      else if (p.x > w - CM) p.vx -= (1 - (w - p.x) / CM) * 80 * dt;
+      if (p.x < 4) { p.x = 4; p.vx = Math.abs(p.vx) * 0.4; }
+      if (p.x > w - 4) { p.x = w - 4; p.vx = -Math.abs(p.vx) * 0.4; }
+      if (p.y < -30) p.y = h + 30; if (p.y > h + 30) p.y = -30;
+    }
+    const col = _mixHex(P.cold, P.hot, u);
+    const R = (7 + near[i] * 1.5) * p.r * P.blob;        // a well-connected blob reads as bigger
+    const gr = x.createRadialGradient(p.x, p.y, 0, p.x, p.y, R);
+    gr.addColorStop(0, `rgba(${col},${0.55 * A})`);
+    gr.addColorStop(0.45, `rgba(${col},${0.20 * A})`);
+    gr.addColorStop(1, `rgba(${col},0)`);
+    x.fillStyle = gr; x.beginPath(); x.arc(p.x, p.y, R, 0, 7); x.fill();
+    x.fillStyle = `rgba(${col},${0.5 * A})`;   // bright core
+    x.beginPath(); x.arc(p.x, p.y, 1.6 * p.r * P.blob, 0, 7); x.fill();
+  }
+  x.restore();
 };
 
 /* --- code rain --- */
@@ -3254,15 +3919,23 @@ FX_BACK.codeRain = (x, w, h, t, a) => {
   const dt = Math.min(0.05, t - (_rain._last || t)); _rain._last = t;
   const rgb = _fxRGB(0.05), A = a * P.opacity;
   x.font = '12px "IBM Plex Mono",monospace'; x.textBaseline = 'top';
+  // a column is a vertical line, so the cursor shoves it sideways and it springs back —
+  // the columns part around the pointer and close up again behind it
+  const DM = fxMouse('codeRain');
   _rain.forEach((c, i) => {
     c.y += c.sp * dt * P.speed;
     if (c.y - c.len * 14 > h) { c.y = -Math.random() * 120; c.sp = 26 + Math.random() * 64; }
+    const cxp = i * step;
+    if (DM) {
+      const f = fxMouseAt(DM, cxp + (c.ox || 0), c.y);
+      springStep(c, f.fx * 2.2, 0, 0.06, 0.88, 140);   // sideways only; gravity owns y
+    } else if (c.ox) springStep(c, 0, 0, 0.06, 0.88, 140);
     for (let k = 0; k < c.len; k++) {
       const yy = c.y - k * 14;
       if (yy < -14 || yy > h) continue;
       x.fillStyle = k === 0 ? `rgba(${_fxRGB(0.75)},${0.9 * A})`
         : `rgba(${rgb},${Math.pow(1 - k / c.len, 1.4) * 0.34 * A})`;
-      x.fillText(G[(i * 7 + k * 13 + (t * 6 | 0)) % G.length], i * step, yy);
+      x.fillText(G[(i * 7 + k * 13 + (t * 6 | 0)) % G.length], cxp + (c.ox || 0), yy);
     }
   });
 };
@@ -3286,22 +3959,38 @@ FX_BACK.circuit = (x, w, h, t, a) => {
     _traces._w = w; _traceN = P.traces;
   }
   const rgb = _fxRGB(0.05), A = a * P.opacity;
+  // The wires are static geometry, so the cursor bends them via a per-vertex spring
+  // displacement rather than a velocity: the lattice deforms under the cursor and snaps
+  // back behind it. Each vertex carries its own {ox,oy}, held on the point array itself.
+  const RM = fxMouse('circuit');
   for (const tr of _traces) {
+    for (const p of tr.pts) {
+      if (RM) {
+        const f = fxMouseAt(RM, p[0] + (p.ox || 0), p[1] + (p.oy || 0));
+        springStep(p, f.fx * 1.6, f.fy * 1.6, 0.08, 0.86, 90);
+      } else if (p.ox) { springStep(p, 0, 0, 0.08, 0.86, 90); }
+    }
+    const P0 = tr.pts[0];
     x.strokeStyle = `rgba(${rgb},${0.13 * A})`; x.lineWidth = 1;
-    x.beginPath(); x.moveTo(tr.pts[0][0], tr.pts[0][1]);
-    for (let i = 1; i < tr.pts.length; i++) x.lineTo(tr.pts[i][0], tr.pts[i][1]);
+    x.beginPath(); x.moveTo(P0[0] + (P0.ox || 0), P0[1] + (P0.oy || 0));
+    for (let i = 1; i < tr.pts.length; i++) {
+      const q = tr.pts[i]; x.lineTo(q[0] + (q.ox || 0), q[1] + (q.oy || 0));
+    }
     x.stroke();
     const f = (tr.off + t * tr.sp * P.speed) % 1, seg = f * (tr.pts.length - 1);
     const i0 = Math.floor(seg), k = seg - i0;
     const p0 = tr.pts[i0], p1 = tr.pts[Math.min(i0 + 1, tr.pts.length - 1)];
-    const px = p0[0] + (p1[0] - p0[0]) * k, py = p0[1] + (p1[1] - p0[1]) * k;
+    // interpolate along the DISPLACED wire, so the pulse keeps riding the bent trace
+    const a0x = p0[0] + (p0.ox || 0), a0y = p0[1] + (p0.oy || 0);
+    const a1x = p1[0] + (p1.ox || 0), a1y = p1[1] + (p1.oy || 0);
+    const px = a0x + (a1x - a0x) * k, py = a0y + (a1y - a0y) * k;
     const g = x.createRadialGradient(px, py, 0, px, py, 10);
     g.addColorStop(0, `rgba(${_fxRGB(0.55)},${0.8 * A})`);
     g.addColorStop(1, `rgba(${rgb},0)`);
     x.fillStyle = g; x.beginPath(); x.arc(px, py, 10, 0, 7); x.fill();
     for (const p of tr.pts) {
       x.strokeStyle = `rgba(${rgb},${0.30 * A})`; x.lineWidth = 1;
-      x.beginPath(); x.arc(p[0], p[1], 2.2, 0, 7); x.stroke();      // via, not a blob
+      x.beginPath(); x.arc(p[0] + (p.ox || 0), p[1] + (p.oy || 0), 2.2, 0, 7); x.stroke();   // via, not a blob
     }
   }
 };
@@ -3334,11 +4023,19 @@ FX_BACK.radar = (x, w, h, t, a) => {
     _blips = Array.from({ length: P.contacts }, () => ({ a: Math.random() * 6.283, d: 0.15 + Math.random() * 0.8 }));
     _blipN = P.contacts;
   }
+  // blips are fixed polar coordinates with no motion of their own, so the cursor scatters
+  // them via a spring offset and the formation re-forms once it moves away
+  const BM = fxMouse('radar');
   for (const b of _blips) {
+    const bx0 = cx + Math.cos(b.a) * R * b.d, by0 = cy + Math.sin(b.a) * R * b.d;
+    if (BM) {
+      const mf = fxMouseAt(BM, bx0 + (b.ox || 0), by0 + (b.oy || 0));
+      springStep(b, mf.fx * 1.4, mf.fy * 1.4, 0.05, 0.9, R * 0.7);
+    } else if (b.ox) springStep(b, 0, 0, 0.05, 0.9, R * 0.7);
     const da = (ang - b.a + 6.283) % 6.283;         // time since the beam passed
     const f = Math.max(0, 1 - da / 2.4);
     if (f <= 0) continue;
-    const px = cx + Math.cos(b.a) * R * b.d, py = cy + Math.sin(b.a) * R * b.d;
+    const px = bx0 + (b.ox || 0), py = by0 + (b.oy || 0);
     x.fillStyle = `rgba(${_fxRGB(0.5)},${f * 0.85 * A})`;
     x.beginPath(); x.arc(px, py, 2.4, 0, 7); x.fill();
     x.strokeStyle = `rgba(${_fxRGB(0.5)},${f * 0.30 * A})`;
@@ -3476,11 +4173,16 @@ function drawFlybys(x, w, h, t, a) {
     _flyAt = t; _flyGap = 18 + Math.random() * 52;
   }
   const dt = Math.min(0.05, x._dt || 0.016);
+  const FM = fxMouse('flybys');
   _flying = _flying.filter(f => {
+    if (FM) {   // knock it off course; ky persists so a shoved flyby stays shoved
+      const mf = fxMouseAt(FM, f.x, f.y + (f.ky || 0));
+      f.sp += mf.fx * 6; f.ky = (f.ky || 0) + mf.fy * 6;
+    }
     f.x += f.sp * P.speed * dt;   // P.speed is always > 0, so the sign (= direction) holds
     if ((f.sp > 0 && f.x > w + 160) || (f.sp < 0 && f.x < -160)) return false;
     x.save();
-    x.translate(f.x, f.y + Math.sin(t * 0.9 + f.bob) * 7);
+    x.translate(f.x, f.y + (f.ky || 0) + Math.sin(t * 0.9 + f.bob) * 7);
     if (f.dir < 0) x.scale(-1, 1);
     x.scale(f.scale * P.scale, f.scale * P.scale);
     x.rotate(Math.sin(t * 0.5 + f.bob) * f.spin);
@@ -3544,6 +4246,82 @@ function renderFXMedia() {
   have.forEach(n => n.remove());   // layers deleted from settings
 }
 
+/* --- cursor trail ------------------------------------------------------------------
+   One particle pool for all four styles; only the spawn parameters and the draw differ.
+   Kept separate from the effects so it works with every effect switched off, and stepped
+   exactly once per frame even when it is drawn twice (the 'both' layer setting). */
+const _ptrail = [];
+const TRAIL_COL = {   // [hue span start, span width] — resolved per particle at spawn
+  warm: [12, 46], cool: [175, 80], rainbow: [0, 360],
+};
+function _trailRGB(style, seed) {
+  if (style === 'accent') return ACCENT_RGB;
+  const [h0, span] = TRAIL_COL[style] || TRAIL_COL.cool;
+  return _fxHSL(h0 + seed * span).join(',');
+}
+function stepPointerTrail(M, dt, t) {
+  const size = M.trailSize, style = M.trail;
+  // spawn only where the cursor actually moved, and in proportion to how fast — a
+  // stationary cursor should leave a dying puff, not a growing pile
+  const sp = Math.min(60, Math.hypot(Pointer.vx, Pointer.vy));
+  if (Pointer.inside && Pointer.idle < 0.4 && _ptrail.length < 420) {
+    const n = style === 'ribbon' ? 1 : Math.min(6, 1 + (sp * 0.18) | 0);
+    for (let i = 0; i < n; i++) {
+      const jit = style === 'ribbon' ? 0 : (style === 'sparkle' ? 14 : 7) * size;
+      _ptrail.push({
+        x: Pointer.x + (Math.random() - 0.5) * jit,
+        y: Pointer.y + (Math.random() - 0.5) * jit,
+        // flame drifts up, smoke drifts up and spreads, sparkles fly off, ribbon holds still
+        vx: style === 'sparkle' ? (Math.random() - 0.5) * 2.6 + Pointer.vx * 0.15
+          : style === 'smoke' ? (Math.random() - 0.5) * 0.7 + Pointer.vx * 0.05 : Pointer.vx * 0.08,
+        vy: style === 'flame' ? -0.7 - Math.random() * 1.1
+          : style === 'smoke' ? -0.35 - Math.random() * 0.5
+            : style === 'sparkle' ? (Math.random() - 0.5) * 2.6 : Pointer.vy * 0.08,
+        life: 1, decay: style === 'sparkle' ? 0.022 : style === 'flame' ? 0.03 : style === 'smoke' ? 0.011 : 0.02,
+        r: (style === 'smoke' ? 7 + Math.random() * 9 : style === 'flame' ? 4 + Math.random() * 5
+          : style === 'sparkle' ? 1 + Math.random() * 1.8 : 3.5) * size,
+        seed: Math.random(),
+      });
+    }
+  }
+  for (let i = _ptrail.length - 1; i >= 0; i--) {
+    const p = _ptrail[i];
+    p.x += p.vx; p.y += p.vy;
+    if (style === 'smoke') { p.vx *= 0.98; p.vy *= 0.985; p.r += 0.22 * size; }   // billow
+    if (style === 'sparkle') { p.vy += 0.045; p.vx *= 0.985; }                    // fall
+    p.life -= p.decay;
+    if (p.life <= 0) _ptrail.splice(i, 1);
+  }
+  return _ptrail.length;
+}
+function drawPointerTrail(x, M) {
+  const style = M.trail;
+  if (style === 'ribbon') {                 // one continuous stroke through the pool
+    if (_ptrail.length < 2) return;
+    x.lineCap = x.lineJoin = 'round';
+    for (let i = 1; i < _ptrail.length; i++) {
+      const a = _ptrail[i - 1], b = _ptrail[i];
+      x.strokeStyle = `rgba(${_trailRGB(M.trailCol, b.seed)},${(b.life * 0.55).toFixed(3)})`;
+      x.lineWidth = b.r * 2 * b.life;
+      x.beginPath(); x.moveTo(a.x, a.y); x.lineTo(b.x, b.y); x.stroke();
+    }
+    return;
+  }
+  const add = style === 'flame' || style === 'sparkle';
+  if (add) x.globalCompositeOperation = 'lighter';   // fire and sparks ADD, they do not cover
+  for (const p of _ptrail) {
+    const rgb = style === 'flame'
+      // a flame is hottest at its core: ride the particle's own life from white to the hue
+      ? _trailRGB(M.trailCol === 'accent' ? 'warm' : M.trailCol, p.seed * 0.35 + (1 - p.life) * 0.6)
+      : _trailRGB(M.trailCol, p.seed);
+    const a = style === 'smoke' ? p.life * 0.16 : p.life * (style === 'flame' ? 0.5 : 0.85);
+    x.fillStyle = `rgba(${rgb},${a.toFixed(3)})`;
+    x.beginPath(); x.arc(p.x, p.y, Math.max(0.4, p.r * (style === 'sparkle' ? p.life : 1)), 0, 6.283);
+    x.fill();
+  }
+  if (add) x.globalCompositeOperation = 'source-over';
+}
+
 function initFX() {
   const back = $('#fxback'), fore = $('#fxfore');
   if (!back || !fore) return;
@@ -3567,7 +4345,13 @@ function initFX() {
     const alpha = s.fxIntensity != null ? +s.fxIntensity : 1;
     const backOn = Object.keys(FX_BACK).filter(k => s[k]);
     const foreOn = Object.keys(FX_FORE).filter(k => s[k]);
-    if (!backOn.length && !foreOn.length) {            // nothing enabled: cost is one branch
+    agePointer(dt);   // decay the cursor's velocity and age its idle timer once per frame
+    const M = fxp('mouse');
+    // the trail is independent of every effect toggle, so it keeps the loop alive on its
+    // own — otherwise switching all effects off would silently kill it too
+    if (M.trail !== 'off') stepPointerTrail(M, dt, t); else _ptrail.length = 0;
+    const live = _ptrail.length > 0;
+    if (!backOn.length && !foreOn.length && !live) {   // nothing enabled: cost is one branch
       if (back._dirty) { bx.clearRect(0, 0, back.width, back.height); back._dirty = false; }
       if (fore._dirty) { fx.clearRect(0, 0, fore.width, fore.height); fore._dirty = false; }
       return;
@@ -3576,12 +4360,19 @@ function initFX() {
     fx.clearRect(0, 0, fore.width, fore.height); fore._dirty = true;
     bx._dt = fx._dt = dt;
     for (const k of backOn) {
+      _fxHue = fxHueOf(k);   // every _fxRGB() inside this effect now resolves to its colour
       try { FX_BACK[k](bx, back.width, back.height, t, alpha); }
       catch (e) { /* a broken effect must not take the others down */ }
     }
+    // the trail draws BEHIND the windows here and in front of them below, so 'both' is
+    // genuinely two passes over the same particles rather than a copy of the layer
+    if (live && M.trailLayer !== 'fore') { _fxHue = null; try { drawPointerTrail(bx, M); } catch (e) { /**/ } }
     for (const k of foreOn) {
+      _fxHue = fxHueOf(k);
       try { FX_FORE[k](fx, fore.width, fore.height, t, alpha); } catch (e) { /* ditto */ }
     }
+    if (live && M.trailLayer !== 'back') { _fxHue = null; try { drawPointerTrail(fx, M); } catch (e) { /**/ } }
+    _fxHue = null;                       // leave the global state as we found it
   })(0);
 }
 
@@ -3665,6 +4456,7 @@ async function boot() {
   Theme.apply(Theme.current());
   Settings.apply();
   initStars();
+  trackPointer();    // cursor position/velocity for the pointer field and trails
   initFX();          // opt-in ambient layer; its loop no-ops until something is enabled
   renderFXMedia();   // user-supplied GIF/image layers (DOM, not canvas)
   const log = $('#bootlog'), bar = $('#bootbar i');
@@ -3758,4 +4550,4 @@ window.ZTailscale = ZTailscale;
 $('#boot').addEventListener('click', () => $('#boot').classList.add('done'));
 
 /* ================= debug handle (verification) ================= */
-window.ZDEBUG = { WM, State, Bus, Dock, Palette, setScale, Settings, Theme, THEMES };
+window.ZDEBUG = { WM, State, Bus, Dock, Palette, setScale, uiScale, Settings, Theme, THEMES };

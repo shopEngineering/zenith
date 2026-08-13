@@ -8177,6 +8177,13 @@ class Handler(BaseHTTPRequestHandler):
                 with _builders_lock:
                     return self._json({"builders": [builder_public(x)
                                                     for x in BUILDERS.values()]})
+            if route == "/api/pa":
+                # Display name for the prime-agent box, so the terminal panel can label
+                # its controls with the operator's own name for it. Deliberately NOT
+                # derived from pa_cfg("host"): that is a user@address, which is both
+                # ugly in a <label> and the kind of thing that must not be baked into
+                # source. Unset -> "" and the UI falls back to a generic word.
+                return self._json({"label": pa_cfg("label", "")})
             if route == "/api/term/list":
                 with _terms_lock:
                     terms = [term_public(t) for t in TERMS.values()]

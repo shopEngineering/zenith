@@ -46,12 +46,15 @@ input:focus,select:focus,textarea:focus{border-color:var(--line-strong);box-shad
 select option{background:var(--panel-solid);color:var(--text)}
 
 /* ============ atmosphere ============ */
-#nebula{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.55;filter:blur(22px);
+/* The var()s below are the per-effect knobs (FX_SPECS + applyFXVars). Each carries the
+   value it had when it was a constant as its fallback, so an effect with nothing saved
+   renders exactly as it always did. */
+#nebula{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:var(--neb-a,.55);filter:blur(var(--neb-blur,22px));
   background:
     radial-gradient(38vw 38vw at 18% 28%, color-mix(in srgb,var(--acc) 12%,transparent), transparent 62%),
     radial-gradient(46vw 46vw at 82% 62%, rgba(157,140,255,.11), transparent 62%),
     radial-gradient(34vw 34vw at 62% 16%, rgba(78,240,166,.07), transparent 60%);
-  animation:nebuladrift 44s ease-in-out infinite alternate}
+  animation:nebuladrift var(--neb-t,44s) ease-in-out infinite alternate}
 @keyframes nebuladrift{from{transform:translate3d(-3%,-2%,0) scale(1.06)}to{transform:translate3d(4%,3%,0) scale(1.16)}}
 #stars{position:fixed;inset:0;z-index:1}
 /* ---- opt-in ambient FX (initFX) ------------------------------------------------
@@ -77,43 +80,53 @@ body[data-motion=off] #fxmedia{display:none!important}
 /* HUD corner brackets */
 #hudframe{position:fixed;inset:0;z-index:60;pointer-events:none;display:none}
 body.fx-hud #hudframe{display:block}
-#hudframe i{position:absolute;width:34px;height:34px;border:1.5px solid var(--acc);opacity:.42;
-  animation:hudpulse 3.4s ease-in-out infinite}
+#hudframe i{position:absolute;width:var(--hud-sz,34px);height:var(--hud-sz,34px);
+  border:var(--hud-w,1.5px) solid var(--acc);opacity:calc(.42 * var(--hud-a,1));
+  animation:hudpulse var(--hud-t,3.4s) ease-in-out infinite}
 #hudframe .tl{top:52px;left:10px;border-right:0;border-bottom:0}
 #hudframe .tr{top:52px;right:10px;border-left:0;border-bottom:0;animation-delay:.85s}
 #hudframe .bl{bottom:10px;left:10px;border-right:0;border-top:0;animation-delay:1.7s}
 #hudframe .br{bottom:10px;right:10px;border-left:0;border-top:0;animation-delay:2.55s}
-@keyframes hudpulse{0%,100%{opacity:.20}50%{opacity:.62}}
+@keyframes hudpulse{0%,100%{opacity:calc(.20 * var(--hud-a,1))}50%{opacity:calc(.62 * var(--hud-a,1))}}
 /* periodic bright sweep down the screen */
-#sweepbar{position:fixed;left:0;right:0;height:120px;z-index:60;pointer-events:none;display:none;
+#sweepbar{position:fixed;left:0;right:0;height:var(--sweep-h,120px);z-index:60;pointer-events:none;display:none;
+  opacity:var(--sweep-a,1);
   background:linear-gradient(180deg,transparent,color-mix(in srgb,var(--acc) 9%,transparent),transparent)}
-body.fx-sweep #sweepbar{display:block;animation:sweepdown 7s linear infinite}
-@keyframes sweepdown{0%{top:-120px}100%{top:100%}}
+body.fx-sweep #sweepbar{display:block;animation:sweepdown var(--sweep-t,7s) linear infinite}
+@keyframes sweepdown{0%{top:calc(-1 * var(--sweep-h,120px))}100%{top:100%}}   /* starts fully off-screen whatever the height */
 /* CRT-ish brightness flicker, and an occasional slice glitch */
-body.fx-flicker #desktop{animation:crtflick 5.5s steps(1,end) infinite}
-@keyframes crtflick{0%,96%,100%{filter:none}97%{filter:brightness(1.12)}98%{filter:brightness(.94)}99%{filter:brightness(1.05)}}
-body.fx-glitch #desktop{animation:slicejit 9s steps(1,end) infinite}
+/* --flick-s / --glitch-s scale the deviation from normal, so 0 is a no-op and 2 is
+   twice as violent. var() inside a keyframe resolves against the element each frame,
+   which is what makes these tunable without regenerating the rule. */
+body.fx-flicker #desktop{animation:crtflick var(--flick-t,5.5s) steps(1,end) infinite}
+@keyframes crtflick{0%,96%,100%{filter:none}
+  97%{filter:brightness(calc(1 + .12 * var(--flick-s,1)))}
+  98%{filter:brightness(calc(1 - .06 * var(--flick-s,1)))}
+  99%{filter:brightness(calc(1 + .05 * var(--flick-s,1)))}}
+body.fx-glitch #desktop{animation:slicejit var(--glitch-t,9s) steps(1,end) infinite}
 @keyframes slicejit{0%,93%,100%{transform:none;filter:none}
-  94%{transform:translateX(-2px);filter:drop-shadow(2px 0 rgba(255,0,80,.5)) drop-shadow(-2px 0 rgba(0,255,255,.4))}
-  95%{transform:translateX(3px)}96%{transform:none}}
+  94%{transform:translateX(calc(-2px * var(--glitch-s,1)));
+      filter:drop-shadow(calc(2px * var(--glitch-s,1)) 0 rgba(255,0,80,.5)) drop-shadow(calc(-2px * var(--glitch-s,1)) 0 rgba(0,255,255,.4))}
+  95%{transform:translateX(calc(3px * var(--glitch-s,1)))}96%{transform:none}}
 /* Motion OFF must silence every ambient loop, including these */
 body[data-motion=off] #hudframe i,body[data-motion=off] #sweepbar,
 body[data-motion=off].fx-flicker #desktop,body[data-motion=off].fx-glitch #desktop{animation:none}
 body[data-motion=off] #sweepbar{display:none}
-#horizon{position:fixed;inset:auto 0 0 0;height:42vh;z-index:1;pointer-events:none;
+#horizon{position:fixed;inset:auto 0 0 0;height:var(--hor-h,42vh);z-index:1;pointer-events:none;
+  opacity:var(--hor-a,1);
   background:
     linear-gradient(to top, color-mix(in srgb,var(--acc) 4.5%,transparent), transparent 70%),
-    repeating-linear-gradient(to right, color-mix(in srgb,var(--acc) 5%,transparent) 0 1px, transparent 1px 72px),
-    repeating-linear-gradient(to top, color-mix(in srgb,var(--acc) 5%,transparent) 0 1px, transparent 1px 46px);
+    repeating-linear-gradient(to right, color-mix(in srgb,var(--acc) 5%,transparent) 0 1px, transparent 1px var(--hor-gap,72px)),
+    repeating-linear-gradient(to top, color-mix(in srgb,var(--acc) 5%,transparent) 0 1px, transparent 1px var(--hor-gap2,46px));
   mask-image:linear-gradient(to top,black,transparent);
-  transform:perspective(520px) rotateX(58deg) scale(1.6);transform-origin:bottom}
-#scan{position:fixed;inset:0;z-index:60;pointer-events:none;opacity:.05;
-  background:repeating-linear-gradient(to bottom,rgba(255,255,255,.5) 0 1px,transparent 1px 3px)}
-#vig{position:fixed;inset:0;z-index:60;pointer-events:none;
-  background:radial-gradient(ellipse at 50% 42%,transparent 55%,rgba(0,0,0,.5))}
-#grain{position:fixed;inset:-60%;z-index:61;pointer-events:none;opacity:.05;display:none;
+  transform:perspective(520px) rotateX(var(--hor-tilt,58deg)) scale(1.6);transform-origin:bottom}
+#scan{position:fixed;inset:0;z-index:60;pointer-events:none;opacity:var(--scan-a,.05);
+  background:repeating-linear-gradient(to bottom,rgba(255,255,255,.5) 0 1px,transparent 1px var(--scan-pitch,3px))}
+#vig{position:fixed;inset:0;z-index:60;pointer-events:none;opacity:var(--vig-a,1);
+  background:radial-gradient(ellipse at 50% 42%,transparent var(--vig-size,55%),rgba(0,0,0,.5))}
+#grain{position:fixed;inset:-60%;z-index:61;pointer-events:none;opacity:var(--grain-a,.05);display:none;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  animation:grainshift .5s steps(3) infinite}
+  animation:grainshift var(--grain-t,.5s) steps(3) infinite}
 @keyframes grainshift{0%{transform:translate(0,0)}33%{transform:translate(-4%,3%)}66%{transform:translate(3%,-2%)}100%{transform:translate(0,0)}}
 /* glow-off mode */
 body.fx-noglow{--glow:none}
@@ -154,9 +167,14 @@ body.fx-noglow .win::before{opacity:.3}
   border:2px solid #04121a;cursor:pointer;box-shadow:0 0 8px color-mix(in srgb,var(--acc) 70%,transparent)}
 .fxslider input[type=range]::-moz-range-progress{background:var(--acc);height:4px;border-radius:2px}
 .fxslider input[type=range]:focus-visible{outline:1px solid var(--acc);outline-offset:4px}
-/* hue slider: rainbow track (fill gradient not used) */
+/* hue slider: the track IS the spectrum, so the slider shows what it selects
+   rather than an accent bar that could be any quantity. Used by the accent/text
+   hue controls and by every 0-360 per-effect knob (see buildParams). */
 .fxslider input[type=range].hue{background:linear-gradient(90deg,
   hsl(0,90%,60%),hsl(60,90%,60%),hsl(120,90%,55%),hsl(180,90%,55%),hsl(240,90%,65%),hsl(300,90%,60%),hsl(360,90%,60%))}
+/* Firefox paints an accent "progress" bar over the left of the track, which would
+   hide half the spectrum — there is no amount-filled here, only a position. */
+.fxslider input[type=range].hue::-moz-range-progress{background:transparent}
 .fxslider .v{flex:none;min-width:48px;text-align:right;color:var(--acc);font-size:11.5px}
 .fxslider .v.flash{animation:vflash .4s ease}
 @keyframes vflash{0%{transform:scale(1.3);text-shadow:0 0 12px var(--acc)}100%{transform:none}}
@@ -212,6 +230,82 @@ body.fx-noglow .win::before{opacity:.3}
 .settings-wrap .modgrid .mod .mn{flex:1;font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .settings-wrap .modgrid .mod .mi{flex:none;width:16px;height:16px;display:inline-flex;color:var(--dim)}
 .settings-wrap .modgrid .mod .mi svg{width:16px;height:16px}
+/* --- settings control taxonomy --------------------------------------------
+   One visual grammar per KIND of control, so unlike things stop looking alike:
+   .seg   one choice among N — a single hairline housing with flat segments;
+          the JS keeps toggling .acc on the selected option, unchanged
+   .tgl   boolean (existing)
+   .btn   verb — weight/colour by consequence: .primary commits, .warn touches
+          the system, .danger destroys, ghost stays routine
+   .note  commentary rail — something you read, not something you operate */
+.settings-wrap .btnrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.settings-wrap .seg{display:inline-flex;flex-wrap:wrap;gap:0;border:1px solid var(--line);
+  border-radius:calc(var(--radius) - 3px);overflow:hidden;background:rgba(4,10,15,.45)}
+.settings-wrap .seg .btn{border:none;border-radius:0;background:transparent;color:var(--faint);
+  box-shadow:none;letter-spacing:.1em}
+.settings-wrap .seg .btn+.btn{border-left:1px solid var(--line)}
+.settings-wrap .seg .btn:hover{color:var(--text);box-shadow:none;
+  background:color-mix(in srgb,var(--acc) 6%,transparent)}
+.settings-wrap .seg .btn.acc{background:color-mix(in srgb,var(--acc) 16%,transparent);color:var(--acc);
+  box-shadow:inset 0 0 10px color-mix(in srgb,var(--acc) 12%,transparent);
+  text-shadow:0 0 8px color-mix(in srgb,var(--acc) 40%,transparent)}
+.settings-wrap .btn.primary{color:var(--bright);border-color:color-mix(in srgb,var(--acc) 55%,transparent);
+  background:color-mix(in srgb,var(--acc) 17%,transparent);
+  box-shadow:0 0 12px color-mix(in srgb,var(--acc) 14%,transparent)}
+.settings-wrap .btn.primary:hover{background:color-mix(in srgb,var(--acc) 26%,transparent)}
+.settings-wrap .note{display:flex;gap:10px;align-items:flex-start;margin:2px 0 10px;
+  padding:1px 6px 1px 10px;border-left:2px solid var(--line)}
+.settings-wrap .note .fxl{flex:1}
+.settings-wrap .note .d{color:var(--faint);font-size:10.5px;line-height:1.55}
+.settings-wrap .note .btn{flex:none;margin-top:1px}
+/* a slider showing "theme" is at its default — that is an absence, not a value */
+.settings-wrap .fxslider .v.def{color:var(--faint)}
+/* --- effects hierarchy: three levels, three different KINDS of clothing ------
+   .h2        section title (accent tick + fading rule, uppercase)  — you read it
+   .fxcat     category disclosure — leading chevron-well, mixed-case
+              label, count chip; the WHOLE row is the hit area      — you open it
+   .fxcatbody the open category's ground: inset tint + a left rail
+              its children visibly hang from                        — you work inside it */
+.settings-wrap .h2{color:var(--text)}
+.settings-wrap .fxcat{display:flex;width:100%;align-items:center;gap:9px;margin:3px 0;
+  padding:6px 8px 6px 6px;border:1px solid transparent;border-radius:8px;background:transparent;
+  font:600 11.5px var(--disp);letter-spacing:.05em;text-transform:none;color:var(--dim);
+  cursor:pointer;text-align:left;transition:.15s}
+.settings-wrap .fxcat:hover{color:var(--text);border-color:var(--line);
+  background:color-mix(in srgb,var(--acc) 5%,transparent)}
+.settings-wrap .fxcat:focus-visible{outline:1px solid var(--acc);outline-offset:2px}
+.settings-wrap .fxcat .caret{flex:none;width:18px;height:18px;display:inline-flex;align-items:center;
+  justify-content:center;border:1px solid var(--line);border-radius:5px;color:var(--faint);
+  font-size:10px;line-height:1;transition:.15s}
+.settings-wrap .fxcat:hover .caret{border-color:var(--line-strong);color:var(--text)}
+.settings-wrap .fxcat .nm{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.settings-wrap .fxcat .cnt{flex:none;font:600 9.5px var(--disp);color:var(--faint);
+  border:1px solid var(--line);border-radius:9px;padding:1px 7px}
+.settings-wrap .fxcat.acc{color:var(--text)}
+.settings-wrap .fxcat.acc .caret{background:color-mix(in srgb,var(--acc) 14%,transparent);
+  border-color:color-mix(in srgb,var(--acc) 45%,transparent);color:var(--acc);
+  box-shadow:0 0 8px color-mix(in srgb,var(--acc) 20%,transparent)}
+.settings-wrap .fxcat.acc .cnt{color:var(--acc);
+  border-color:color-mix(in srgb,var(--acc) 35%,transparent)}
+.settings-wrap .fxcatbody{margin:0 0 8px 14px;padding:2px 6px 4px 10px;
+  border-left:2px solid color-mix(in srgb,var(--acc) 30%,transparent);
+  border-radius:0 8px 8px 0;background:color-mix(in srgb,var(--acc) 2.5%,transparent)}
+/* a row that owns a collapsible panel: the whole row is its expander */
+.settings-wrap .fxrow.hasx{cursor:pointer}
+/* collapse-all rides the section rule's far end (order beats the ::after rail) */
+.settings-wrap .h2>.btn{order:1;flex:none;font-size:9px;letter-spacing:.08em;
+  padding:3px 8px;color:var(--faint)}
+.settings-wrap .h2>.btn:hover{color:var(--text)}
+/* system: dependency rows are readouts, not clickable */
+.settings-wrap .row.noclick{cursor:default}
+.settings-wrap .row.noclick:hover{background:transparent;border-color:transparent}
+/* statusline: an empty selection is a warning, not a statistic */
+.settings-wrap .small.warn0{color:var(--amber)}
+/* integrations: the card wears its status as a left stripe, matching its dot */
+.settings-wrap .intcard{border-left-width:2px;transition:border-color .2s}
+.settings-wrap .intcard[data-st=green]{border-left-color:color-mix(in srgb,var(--green) 65%,transparent)}
+.settings-wrap .intcard[data-st=amber]{border-left-color:color-mix(in srgb,var(--amber) 65%,transparent)}
+.settings-wrap .intcard[data-st=grey]{border-left-color:color-mix(in srgb,var(--faint) 50%,transparent)}
 /* motion level (Settings → Effects): calm kills ambient loops, off kills everything */
 body[data-motion=calm] #nebula,body[data-motion=calm] #grain,
 body[data-motion=calm] .livedot,body[data-motion=calm] .pill.run,
@@ -298,6 +392,22 @@ body.glow-on .win.focus::before{opacity:1;height:2px;filter:drop-shadow(0 0 calc
   box-shadow:0 0 0 2px color-mix(in srgb,var(--acc) 60%,transparent),
     0 0 26px color-mix(in srgb,var(--acc) 40%,transparent)!important}
 .win.closing{animation:winclose .16s ease both}
+/* "show desktop" — clicking the bare desktop fades its windows out of the way to reveal the
+   background; clicking again brings exactly that set back. Visual only: nothing is unmounted,
+   so terminals keep running behind it. Same animation idiom as .closing (a filled animation is
+   what beats .win's own winopen fill), which also means the motion rules further up already
+   tame it — prefers-reduced-motion collapses the duration, and data-motion=off drops the
+   animation entirely, hence the plain fallback that still hides the window there. */
+.win.peek-hide{animation:peekout .18s ease both;pointer-events:none}
+/* peek-in is NOT taken off once it has played, and that is deliberate. Removing it changes
+   the element's animation-name back to .win's own winopen, which RESTARTS it — the windows
+   would come back, sit still for a moment, then blink out and fade in a second time. It
+   stays until the next hide takes it off (see setPeek). `:not(.closing)` so a window closed
+   later still gets its close animation, which this rule would otherwise shadow. */
+.win.peek-in:not(.closing){animation:peekin .22s cubic-bezier(.2,.9,.3,1) both}
+body[data-motion=off] .win.peek-hide{opacity:0}
+@keyframes peekout{to{opacity:0;transform:scale(.985) translateY(10px)}}
+@keyframes peekin{from{opacity:0;transform:scale(.985) translateY(10px)}to{opacity:1;transform:none}}
 @keyframes winopen{from{opacity:0;transform:scale(.94) translateY(14px)}to{opacity:1;transform:none}}
 @keyframes winclose{to{opacity:0;transform:scale(.95) translateY(8px)}}
 .win-head{display:flex;align-items:center;gap:9px;height:37px;padding:0 8px 0 13px;
@@ -378,6 +488,11 @@ body[data-dock=left] #dock .wsc #wsc-desks,body[data-dock=right] #dock .wsc #wsc
 #dock .wsc .dsw.filled::after{content:'';position:absolute;top:3px;right:3px;width:3px;height:3px;border-radius:50%;
   background:var(--amber);box-shadow:0 0 5px var(--amber)}
 #dock .wsc .dsw.on.filled::after{background:var(--acc);box-shadow:0 0 5px var(--acc)}
+/* windows hidden on this desktop: hollow it out and dash the border — the contents are
+   stashed, not gone, and the button is what puts them back */
+#dock .wsc .dsw.on.peeking{background:none;border-style:dashed;color:var(--amber);
+  border-color:color-mix(in srgb,var(--amber) 55%,transparent)}
+#dock .wsc .dsw.on.peeking.filled::after{background:var(--amber);box-shadow:0 0 5px var(--amber)}
 #dock .wsc .dsw.add,#dock .wsc .dsw.exp{color:var(--faint);font-size:13px}
 #dock .wsc .dsw.add:hover,#dock .wsc .dsw.exp:hover{color:var(--acc)}
 #dock .wsc .arrbtn{position:relative;display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:7px;
@@ -481,19 +596,31 @@ body[data-dock=left] #dock .wsc .arrbtn .glyph svg,body[data-dock=right] #dock .
 .snapline.h{height:2px;left:0;right:0}
 
 /* ============ settings drawer (left slide-out; closes on outside click) ============ */
-#scrim{position:fixed;inset:0;z-index:150;display:none;opacity:0;
-  background:rgba(2,6,10,.30);backdrop-filter:blur(1.5px);transition:opacity .26s ease}
-#scrim.show{display:block;opacity:1}
+/* The scrim stays in the DOM as the click-outside-to-close target, but paints NOTHING:
+   dimming the desktop hid the very effects this panel exists to tune. The drawer is set
+   apart by the accent glow down its right edge instead (see #drawer's box-shadow and the
+   ::after below), which reads as "this is on top" without blanking what is behind it. */
+#scrim{position:fixed;inset:0;z-index:150;display:none;background:transparent}
+#scrim.show{display:block}
 #drawer{position:fixed;top:46px;left:0;bottom:0;width:580px;max-width:92vw;z-index:151;
-  display:flex;flex-direction:column;overflow:hidden;background:var(--panel);
+  display:flex;flex-direction:column;overflow:visible;background:var(--panel);
   backdrop-filter:blur(calc(var(--blur) + 2px));
-  border-right:1px solid var(--line-strong);
-  box-shadow:28px 0 80px rgba(0,0,0,.6),0 0 44px color-mix(in srgb,var(--acc) 12%,transparent);
+  border-right:1px solid var(--acc);
+  box-shadow:2px 0 18px color-mix(in srgb,var(--acc) 42%,transparent),
+             18px 0 60px color-mix(in srgb,var(--acc) 16%,transparent),
+             26px 0 90px rgba(0,0,0,.55);
   transform:scale(.46);transform-origin:0 50%;opacity:0;pointer-events:none;
   transition:transform .32s cubic-bezier(.2,.9,.3,1.2),opacity .2s ease}
 #drawer.show{transform:none;opacity:1;pointer-events:auto}
 #drawer::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;z-index:2;
   background:linear-gradient(90deg,var(--acc),transparent);opacity:.6}
+/* the spill itself: a soft accent bloom just outside the right edge, brightest at the
+   border and gone within ~26px. pointer-events:none so it never eats a click. */
+#drawer::after{content:'';position:absolute;top:0;bottom:0;left:100%;width:26px;
+  pointer-events:none;
+  background:linear-gradient(90deg,color-mix(in srgb,var(--acc) 30%,transparent),transparent)}
+/* the drawer BODY must still clip its own scroll — only the shell shows the spill */
+.drawer-body{overflow:auto}
 .drawer-head{display:flex;align-items:center;gap:10px;height:46px;padding:0 10px 0 16px;flex:none;
   border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--acc) 3%,transparent)}
 .drawer-head .wicon{width:16px;height:16px;color:var(--acc);flex:none}
@@ -550,7 +677,10 @@ body[data-dock=autohide].dock-pinned #dock{box-shadow:0 3px 0 -1px color-mix(in 
 /* ============ command palette ============ */
 #pal{position:fixed;inset:0;z-index:150;display:none;background:rgba(2,5,8,.55);backdrop-filter:blur(3px)}
 #pal.show{display:block}
-#palbox{position:absolute;top:16%;left:50%;transform:translateX(-50%);width:min(640px,92vw);
+/* centring rides on `translate`, not `transform`: winopen below animates transform and ends on
+   `transform:none` with fill-mode both, which would wipe a translateX(-50%) and leave the box
+   half a width right of centre (off the screen edge entirely at 125%). */
+#palbox{position:absolute;top:16%;left:50%;translate:-50% 0;width:min(640px,92vw);
   background:rgba(7,15,23,.96);border:1px solid var(--line-strong);border-radius:12px;
   box-shadow:0 30px 90px rgba(0,0,0,.7),var(--glow);overflow:hidden;
   animation:winopen .18s ease both}
@@ -632,6 +762,9 @@ body[data-dock=autohide].dock-pinned #dock{box-shadow:0 3px 0 -1px color-mix(in 
 .btn:hover{background:color-mix(in srgb,var(--acc) 10%,transparent);box-shadow:var(--glow)}
 .btn.warn{color:var(--amber);border-color:rgba(255,180,94,.4)}
 .btn.warn:hover{background:rgba(255,180,94,.08);box-shadow:0 0 20px rgba(255,180,94,.15)}
+.btn.danger{color:var(--red);border-color:color-mix(in srgb,var(--red) 40%,transparent)}
+.btn.danger:hover{background:color-mix(in srgb,var(--red) 9%,transparent);
+  box-shadow:0 0 20px color-mix(in srgb,var(--red) 15%,transparent)}
 .btn.ghost{color:var(--dim);border-color:var(--line)}
 .btn.ghost:hover{color:var(--text);box-shadow:none;background:color-mix(in srgb,var(--acc) 5%,transparent)}
 .btn.sm{padding:5px 10px;letter-spacing:.1em;font-size:10px}
@@ -1128,6 +1261,10 @@ table.tbl.woffers tr.wchosen td{background:rgba(84,211,138,.07)}
 
 <script src="arrange-filter.js"></script>
 <script src="flyby-timing.js"></script>
+<script src="constellation-links.js"></script>
+<script src="constellation-gravity.js"></script>
+<script src="pointer-field.js"></script>
+<script src="term-links.js"></script>
 <script src="app.js"></script>
 <script src="apps.js"></script>
 </body>

@@ -532,15 +532,15 @@ const TerminalLauncherApp = {
           <option value="shell">shell (zsh)</option>
           <option value="claude">claude — interactive</option>
           <option value="claude-continue">claude --continue</option>
-          <option value="prime-agent">prime-agent (gpu-node)</option></select></div>
+          <option value="prime-agent" id="tmodepa">prime-agent (GPU node)</option></select></div>
         <div><span class="klabel">effort</span><select id="teffort" style="width:100%">
           <option value="low">low</option><option value="medium">medium</option>
           <option value="high">high</option></select></div>
       </div>
       <div id="twtrow" style="display:none;margin-bottom:10px">
-        <span class="klabel">gpu-node worktree</span>
+        <span class="klabel"><span class="pa-host">GPU node</span> worktree</span>
         <input type="text" id="twt" style="width:100%" spellcheck="false">
-        <div style="margin-top:4px;color:var(--dim);font-size:11.5px">runs sandboxed on gpu-node; container stops when the terminal exits</div>
+        <div style="margin-top:4px;color:var(--dim);font-size:11.5px">runs sandboxed on <span class="pa-host">the GPU node</span>; container stops when the terminal exits</div>
       </div>
       <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
         <label style="display:flex;gap:7px;align-items:center;color:var(--dim);font-size:11.5px;cursor:pointer">
@@ -586,6 +586,17 @@ const TerminalLauncherApp = {
     // a browser reload or a server restart.
     const twtrow = body.querySelector('#twtrow');
     const twt = body.querySelector('#twt');
+    // What to CALL that box is the operator's own machine name, so it lives in
+    // data/pa.json ("label") rather than in this file — deploy.sh never touches data/,
+    // and source that names someone's hardware cannot be published. Unset, or the
+    // request failing, leaves the generic wording already in the markup.
+    apiSafe('/api/pa', undefined, { silent: true }).then(r => {
+      const name = ((r && r.label) || '').trim();
+      if (!name) return;
+      body.querySelectorAll('.pa-host').forEach(s => { s.textContent = name; });
+      const opt = body.querySelector('#tmodepa');
+      if (opt) opt.textContent = `prime-agent (${name})`;
+    });
     const paDefaultWt = () => '~/scratch/pa-work/zenith-'
       + new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
     tmode.onchange = () => {
@@ -5607,6 +5618,7 @@ const SettingsApp = {
         ['solarSystem', 'Solar system', 'orbiting planets on a tilted plane, bottom right'],
         ['aurora', 'Aurora', 'flowing borealis ribbons across the top'],
         ['constellations', 'Constellations', 'drifting nodes that wire up when they get close'],
+        ['lavaLamp', 'Lava lamp', 'blobs clump, get buoyant, rise, break apart and sink', 1],
         ['codeRain', 'Code rain', 'falling glyph columns', 1],
         ['circuit', 'Circuit traces', 'a lattice with pulses running along it'],
         ['radar', 'Radar sweep', 'rotating beam with contacts that fade behind it'],
@@ -5623,6 +5635,11 @@ const SettingsApp = {
       ]],
       ['WHIMSY', [
         ['flybys', 'Flybys', 'something unexpected crosses the screen now and then'],
+      ]],
+      // The cursor has no on/off toggle of its own — its own 'Cursor field' param is the
+      // switch — so the row is marked `noToggle` and renders as an expander only.
+      ['CURSOR', [
+        ['mouse', 'Cursor field + trail', 'how the pointer disturbs the effects, and what it leaves behind', 0, true],
       ]],
     ];
     const FLYBY_LABELS = { bunny: '🐰 Spacesuit bunny', ufo: '🛸 UFO', satellite: '🛰 Satellite',
@@ -5647,10 +5664,10 @@ const SettingsApp = {
           <input type="range" id="sxsat" min="0" max="100" step="1"><span class="v" id="sxsatv"></span></div>
         <div class="fxslider"><label>Brightness</label>
           <input type="range" id="sxlum" min="25" max="85" step="1"><span class="v" id="sxlumv"></span></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Drives <b>everything chrome-coloured</b> — borders, icons, glow, scrollbars, focus rings,
           selection. Drop saturation for a muted or near-monochrome desk.</div></div>
-          <button class="btn ghost sm" id="sxhuereset" style="flex:none">THEME</button></div>
+          <button class="btn ghost sm" id="sxhuereset" style="flex:none" title="back to the theme's base colour">↺ RESET</button></div>
         <div class="h2">UI TEXT</div>
         <div class="fxslider"><label>Tint</label>
           <input type="range" class="hue" id="sxthue" min="0" max="360" step="1"><span class="v" id="sxthuev"></span></div>
@@ -5658,10 +5675,10 @@ const SettingsApp = {
           <input type="range" id="sxtsat" min="0" max="100" step="1"><span class="v" id="sxtsatv"></span></div>
         <div class="fxslider"><label>Contrast</label>
           <input type="range" id="sxtlum" min="60" max="100" step="1"><span class="v" id="sxtlumv"></span></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Interface text only — one ramp drives all four levels, so the contrast relationships the
           UI was designed around hold. Tint strength 0 is neutral grey.</div></div>
-          <button class="btn ghost sm" id="sxtreset" style="flex:none">RESET</button></div>
+          <button class="btn ghost sm" id="sxtreset" style="flex:none" title="back to the default text ramp">↺ RESET</button></div>
         <div class="h2">TERMINAL COLOURS</div>
         <div class="fxslider"><label>Text</label>
           <input type="color" id="sxtermfg" style="width:44px;height:24px;padding:0;border:1px solid var(--line);border-radius:5px;background:none">
@@ -5669,10 +5686,10 @@ const SettingsApp = {
         <div class="fxslider"><label>Background</label>
           <input type="color" id="sxtermbg" style="width:44px;height:24px;padding:0;border:1px solid var(--line);border-radius:5px;background:none">
           <span class="v" id="sxtermbgv"></span></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Session text and background, independent of the base colour — so retinting the desk can
           never make your terminals unreadable.</div></div>
-          <button class="btn ghost sm" id="sxtermreset" style="flex:none">THEME</button></div>
+          <button class="btn ghost sm" id="sxtermreset" style="flex:none" title="back to the theme's terminal colours">↺ RESET</button></div>
         <div class="h2">GLASS &amp; SHAPE</div>
         <div class="fxslider"><label>Panel opacity</label>
           <input type="range" id="sxalpha" min="0.5" max="1" step="0.01"><span class="v" id="sxalphav"></span></div>
@@ -5682,23 +5699,23 @@ const SettingsApp = {
           <input type="range" id="sxrad" min="0" max="18" step="1"><span class="v" id="sxradv"></span></div>
         <div class="h2">DISPLAY</div>
         <div class="fxslider"><label>Font</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-uifont="default">CHAKRA</button>
             <button class="btn ghost sm" data-uifont="system">SYSTEM</button>
             <button class="btn ghost sm" data-uifont="orbitron">ORBITRON</button>
             <button class="btn ghost sm" data-uifont="rajdhani">RAJDHANI</button>
           </div></div>
         <div class="fxslider"><label>Density</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-density="comfortable">COMFORTABLE</button>
             <button class="btn ghost sm" data-density="compact">COMPACT</button>
           </div></div>
         <div class="fxslider"><label>UI scale</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             ${[90, 100, 110, 125].map(p => `<button class="btn ghost sm" data-scale="${p}">${p}%</button>`).join('')}
           </div></div>
         <div class="fxslider"><label>Clock</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-clockh="12">12-HOUR</button>
             <button class="btn ghost sm" data-clockh="24">24-HOUR</button>
           </div></div>
@@ -5718,11 +5735,11 @@ const SettingsApp = {
           <button class="btn sm" data-preset="minimal">MINIMAL</button>
           <button class="btn ghost sm" data-preset="off">ALL OFF</button>
         </div>
-        <div class="h2">VISUAL EFFECTS</div>
+        <div class="h2">VISUAL EFFECTS<button class="btn ghost sm" id="fxfoldall" title="Collapse every category">COLLAPSE ALL</button></div>
         <div id="fxlist"></div>
         <div class="h2">FLYBY CAST</div>
         <div class="btnrow" id="flybycast" style="margin:0 0 4px;flex-wrap:wrap"></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Who is allowed to drift past. Pace, size, speed and which layer they cross on are
           under <b>Flybys ⌄</b> above.</div></div></div>
         <div class="h2">YOUR OWN FLYBYS</div>
@@ -5730,39 +5747,31 @@ const SettingsApp = {
         <div class="btnrow" style="margin:4px 0 0">
           <button class="btn ghost sm" id="flyadd">+ ADD IMAGE</button>
         </div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Any PNG/SVG/GIF. Scaled to ~46px on screen and stored on this machine.</div></div></div>
         <div class="h2">CUSTOM BACKGROUND MEDIA</div>
         <div id="fxmedialist"></div>
         <div class="btnrow" style="margin:4px 0 0">
           <button class="btn ghost sm" id="fxmediaadd">+ ADD GIF / IMAGE</button>
         </div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Animated GIFs play as their own background layer, each with position, size, opacity,
           blend and drift. Held on disk, not in your settings — a GIF would blow the browser's
           storage limit on its own.</div></div></div>
         <div class="h2">AMBIENT INTENSITY</div>
         <div class="fxslider"><label>Strength</label>
           <input type="range" id="sxfxi" min="0.3" max="1.6" step="0.05"><span class="v" id="sxfxiv"></span></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Master opacity for DEEP SPACE + WHIMSY. Turn it down to keep an effect as texture
           rather than a focal point.</div></div></div>
-        <div class="h2">STARFIELD</div>
-        <div class="fxslider"><label>Density</label>
-          <input type="range" id="sxden" min="0.4" max="3" step="0.1"><span class="v" id="sxdenv"></span></div>
-        <div class="fxslider"><label>Brightness</label>
-          <input type="range" id="sxbri" min="0.6" max="2.4" step="0.1"><span class="v" id="sxbriv"></span></div>
-        <div class="h2">WINDOWS</div>
-        <div class="fxslider"><label>Window glow</label>
-          <input type="range" id="sxglow" min="0" max="2" step="0.05"><span class="v" id="sxglowv"></span></div>
         <div class="h2">MOTION</div>
         <div class="fxslider"><label>Animation</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-motion="full">FULL</button>
             <button class="btn ghost sm" data-motion="calm">CALM</button>
             <button class="btn ghost sm" data-motion="off">OFF</button>
           </div></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           <b>Calm</b> stops ambient loops (nebula drift, pulsing dots, star twinkle stays).
           <b>Off</b> freezes every animation and transition, including starfield drift.
           </div></div></div>
@@ -5771,25 +5780,27 @@ const SettingsApp = {
       <div class="settab" data-tab="workspace" style="display:none">
         <div class="h2" style="margin-top:0">AGENTS</div>
         <div class="fxslider"><label>Default agent</label>
-          <div class="btnrow" id="sxagentrow" style="margin:0;flex-wrap:wrap">
+          <div class="btnrow seg" id="sxagentrow" style="margin:0;flex-wrap:wrap">
             <button class="btn ghost sm" data-agent="claude">▸ CLAUDE</button>
           </div></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           The primary button on every project launch surface. The <b>▾</b> next to it always lists all
           enabled agents. Enable more agents in the Agents app.</div></div></div>
         <div class="h2">NEW PROJECTS</div>
         <div class="fxslider"><label>Default folder</label>
           <input id="sxnpfolder" placeholder="~/claudeProjects" style="flex:1;max-width:300px"></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Where <b>+ New Project</b> (in the Projects app) creates folders. Must be under your home
           directory.</div></div></div>
         <div class="h2">AUTO-ARRANGE</div>
         <div class="fxslider"><label>Layout mode</label>
           <div class="btnrow" style="margin:0">
-            <button class="btn ghost sm" data-arr="columns">▥ COLUMNS</button>
-            <button class="btn ghost sm" data-arr="tiled">▦ TILES</button>
-            <button class="btn ghost sm" data-arr="cascade">⧉ CASCADE</button>
-            <button class="btn sm acc" data-arr-now="1">ARRANGE NOW</button>
+            <span class="seg">
+              <button class="btn ghost sm" data-arr="columns">▥ COLUMNS</button>
+              <button class="btn ghost sm" data-arr="tiled">▦ TILES</button>
+              <button class="btn ghost sm" data-arr="cascade">⧉ CASCADE</button>
+            </span>
+            <button class="btn ghost sm" data-arr-now="1">ARRANGE NOW ▸</button>
           </div></div>
         <div class="fxrow"><div class="fxl"><div class="t">Columns · include ▦-off windows</div>
           <div class="d">place windows excluded from auto-arrange in the columns layout too</div></div>
@@ -5801,17 +5812,17 @@ const SettingsApp = {
           <div class="d">show every window on the screen in the cascade — even excluded ones</div></div>
           <button class="tgl ${s.arrangeInclude?.cascade !== false ? 'on' : ''}" data-arrinc="cascade"></button></div>
         <div class="fxslider"><label>Drag behavior</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-drag="reflow">⟲ REFLOW</button>
             <button class="btn ghost sm" data-drag="free">✥ FREE</button>
           </div></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           <b>Reflow</b> — dragging a window in an arranged layout pushes the others aside and fills the void it
           leaves (balls-in-a-pit). <b>Free</b> — drop a window anywhere; the void stays and it only rejoins the
           arrangement when you snap it to an edge.</div></div></div>
         <div class="h2">DOCK</div>
         <div class="fxslider"><label>Position</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-dock="left">◧ LEFT</button>
             <button class="btn ghost sm" data-dock="top">▤ TOP</button>
             <button class="btn ghost sm" data-dock="bottom">▤ BOTTOM</button>
@@ -5822,53 +5833,53 @@ const SettingsApp = {
         <div class="fxrow"><div class="fxl"><div class="t">Persist window layout</div>
           <div class="d">restore each window's exact position &amp; size on reload (off = re-arrange fresh)</div></div>
           <button class="tgl ${s.persistWindows !== false ? 'on' : ''}" id="sxpersist"></button></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Per-window: the ▦ switch in each title bar includes/excludes it from auto-arrange (excluded windows
           stay open, behind the arranged grid). Double-click a title bar to collapse it. Drag near another
           window's edge to snap; grab any edge or corner to resize.
           </div></div></div>
         <div class="fxslider"><label>New window size</label>
-          <div class="btnrow" style="margin:0;flex-wrap:wrap">
+          <div class="btnrow seg" style="margin:0;flex-wrap:wrap">
             <button class="btn ghost sm" data-winsize="app">PER-APP</button>
             <button class="btn ghost sm" data-winsize="quarter">¼</button>
             <button class="btn ghost sm" data-winsize="third">⅓</button>
             <button class="btn ghost sm" data-winsize="half">½</button>
             <button class="btn sm acc" id="sxcapture">⤢ USE FOCUSED</button>
           </div></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Size fresh windows open at. Fractions are of the screen (responsive). <b>Use focused</b> snapshots
           the size of the frontmost window. <span id="sxsizenow"></span>
           </div></div></div>
         <div class="h2">DESKTOPS</div>
         <div class="fxslider"><label>Virtual desktops</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             ${[1, 2, 3, 4, 5, 6].map(n => `<button class="btn ghost sm" data-deskn="${n}">${n}</button>`).join('')}
           </div></div>
         <div class="fxslider"><label>Shortcut style</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-deskkey="ctrl">CONTROL</button>
             <button class="btn ghost sm" data-deskkey="ctrl+alt">CTRL+ALT</button>
           </div></div>
         <div class="fxslider"><label>Switch ←/→ with</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-deskarrow="meta">⌘ CMD</button>
             <button class="btn ghost sm" data-deskarrow="alt">⌥ ALT</button>
             <button class="btn ghost sm" data-deskarrow="shift">⇧ SHIFT</button>
             <button class="btn ghost sm" data-deskarrow="ctrl">⌃ CTRL</button>
           </div></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Spread windows across up to 6 workspaces. Switch from the <b>1·2·3</b> control at the top of the
           screen, the <b>1·2·3</b> chips in each window's title bar, or the keyboard: <span id="sxkeyhelp"></span>.
           <b>⌃0</b> shows all desktops.
           </div></div></div>
         <div class="h2">VOICE INPUT</div>
         <div class="fxslider"><label>Mic source</label>
-          <div class="btnrow" style="margin:0">
+          <div class="btnrow seg" style="margin:0">
             <button class="btn ghost sm" data-stt="auto">AUTO</button>
             <button class="btn ghost sm" data-stt="browser">BROWSER</button>
             <button class="btn ghost sm" data-stt="whisper">WHISPER</button>
           </div></div>
-        <div class="fxrow" style="border:none"><div class="fxl"><div class="d">
+        <div class="note"><div class="fxl"><div class="d">
           Speech-to-text source for the terminal mic. <b>Browser</b> streams word-by-word in real time
           (needs Chrome + localhost/HTTPS). <b>Whisper</b> is local &amp; private but text appears in chunks
           after each pause. <b>Auto</b> uses Whisper when available, else browser.
@@ -5907,89 +5918,196 @@ const SettingsApp = {
     // are generated from FX_SPECS (app.js), so a new knob is one line there and needs
     // no change here — and every effect gets the parameters that actually suit it
     // rather than a shared set that fits none of them.
-    const fxParam = (effect, k, v) => {
-      const all = Object.assign({}, Settings.load().fxp || {});
-      all[effect] = Object.assign({}, all[effect] || {}, { [k]: v });
-      Settings.set('fxp', all);
+    // A spec marked `top` is stored as a TOP-LEVEL setting rather than under fxp[effect].
+    // Those few (starDensity, starBrightness, glowLevel) are named directly by FX_PRESETS
+    // and read by Settings.apply(), so moving their storage would break both. Only where
+    // the control is DRAWN changes: it belongs in its effect's panel, not loose in the
+    // main list, which is the whole point of the exercise.
+    const fxParam = (effect, spec, v) => {
+      if (spec.top) Settings.set(spec.k, v);
+      else {
+        const all = Object.assign({}, Settings.load().fxp || {});
+        all[effect] = Object.assign({}, all[effect] || {}, { [spec.k]: v });
+        Settings.set('fxp', all);
+      }
       if (effect === 'flybys') flybyNow();   // else the change hides until the next one is due
     };
     const fxParamVal = (effect, spec) => {
+      if (spec.top) { const v = Settings.load()[spec.k]; return v !== undefined ? v : spec.def; }
       const saved = (Settings.load().fxp || {})[effect] || {};
       return saved[spec.k] !== undefined ? saved[spec.k] : spec.def;
     };
     const buildParams = (effect, host) => {
+      // A param can declare `when`: it is only shown while that predicate holds against
+      // the effect's live values. Without this the constellation panel shows mass and
+      // oscillation knobs that do nothing until gravity is on, and every panel shows a
+      // Hue slider that is ignored unless Colour is Custom -- controls that look broken.
+      const val = k => fxParamVal(effect, (FX_SPECS[effect] || []).find(p => p.k === k) || { k });
+      const rows = [];
+      const applyWhen = () => rows.forEach(({ spec, node }) => {
+        node.style.display = spec.when && !spec.when(val) ? 'none' : '';
+      });
       (FX_SPECS[effect] || []).forEach(spec => {
         const cur = fxParamVal(effect, spec);
-        if (spec.opts) {
+        if (spec.type === 'color') {
+          const row = el('div', 'fxslider');
+          row.innerHTML = `<label>${esc(spec.label)}</label>
+            <input type="color" style="width:44px;height:24px;padding:0;border:1px solid var(--line);border-radius:5px;background:none">
+            <span class="v"></span>`;
+          const i = row.querySelector('input'), v = row.querySelector('.v');
+          i.value = cur; v.textContent = cur;
+          // fxParam takes the SPEC, not its key — passing spec.k stored every colour under
+          // the literal key `undefined`, so the picker moved and nothing ever changed.
+          i.oninput = () => { fxParam(effect, spec, i.value); v.textContent = i.value; };
+          host.appendChild(row); rows.push({ spec, node: row });
+        } else if (spec.opts) {
           const row = el('div', 'fxslider');
           row.innerHTML = `<label>${esc(spec.label)}</label><div class="btnrow" style="margin:0;flex-wrap:wrap"></div>`;
           const bar = row.querySelector('.btnrow');
-          spec.opts.forEach(([val, lab]) => {
-            const b = el('button', 'chip btnchip' + (String(cur) === String(val) ? ' sel' : ''), esc(lab));
+          spec.opts.forEach(([v2, lab]) => {
+            const b = el('button', 'chip btnchip' + (String(cur) === String(v2) ? ' sel' : ''), esc(lab));
             b.onclick = () => {
-              fxParam(effect, spec.k, val);
+              fxParam(effect, spec, v2);
               bar.querySelectorAll('button').forEach(o => o.classList.remove('sel'));
-              b.classList.add('sel'); blip(880);
+              b.classList.add('sel'); blip(880); applyWhen();
             };
             bar.appendChild(b);
           });
-          host.appendChild(row);
+          host.appendChild(row); rows.push({ spec, node: row });
         } else {
           const id = 'fxp_' + effect + '_' + spec.k;
           const row = el('div', 'fxslider');
+          // A hue knob gets the spectrum as its track: the slider then shows the
+          // thing it selects instead of an accent-coloured bar that could be any
+          // quantity. Detected from the 0-360 domain rather than the key name, so
+          // any future angular colour param picks it up for free.
+          const isHue = +spec.min === 0 && +spec.max === 360;
           row.innerHTML = `<label>${esc(spec.label)}</label>
-            <input type="range" id="${id}" min="${spec.min}" max="${spec.max}" step="${spec.step}">
+            <input type="range" class="${isHue ? 'hue' : ''}" id="${id}"
+              min="${spec.min}" max="${spec.max}" step="${spec.step}">
             <span class="v" id="${id}v"></span>`;
-          host.appendChild(row);
+          host.appendChild(row); rows.push({ spec, node: row });
           const r = row.querySelector('input'), v = row.querySelector('.v');
           const show = () => { v.textContent = spec.fmt(+r.value);
             r.style.setProperty('--p', ((r.value - r.min) / ((r.max - r.min) || 1) * 100) + '%'); };
           r.value = cur; show();
-          r.oninput = () => { fxParam(effect, spec.k, +r.value); show(); };
+          r.oninput = () => { fxParam(effect, spec, +r.value); show(); };
         }
       });
+      applyWhen();
       const reset = el('button', 'btn ghost sm', 'RESET THESE');
       reset.style.margin = '4px 0 2px';
       reset.onclick = () => {
         const all = Object.assign({}, Settings.load().fxp || {});
         delete all[effect]; Settings.set('fxp', all);
+        // `top` params are not inside fxp, so dropping that key cannot reach them —
+        // put each back to the value FX_DEFAULTS ships, by hand
+        (FX_SPECS[effect] || []).filter(p => p.top).forEach(p => Settings.set(p.k, FX_DEFAULTS[p.k]));
         host.replaceChildren(); buildParams(effect, host); blip(520);
       };
       host.appendChild(reset);
     };
+    // ---- accordion: categories open independently, remembered across reloads ---------
+    // The list outgrew a single scroll once every effect gained a panel. Categories
+    // collapse; any number may be open at once. `zen.fxopen` (its own localStorage key,
+    // same idiom as zen.modtab.*, so flipping one never re-runs Settings.apply()) holds
+    // the JSON list of open names — seeded once from the legacy single `fxOpen`.
+    const groupBodies = [];
+    const loadOpen = () => {
+      try {
+        const raw = localStorage.getItem('zen.fxopen');
+        if (raw !== null) return JSON.parse(raw).filter(n => typeof n === 'string');
+      } catch (e) { /* corrupt — fall through to the legacy seed */ }
+      const one = Settings.load().fxOpen;
+      return one ? [one] : [];
+    };
+    const saveOpen = names => { try { localStorage.setItem('zen.fxopen', JSON.stringify(names)); } catch (e) { /* quota */ } };
+    // Which per-effect config panels are expanded. Same idiom, its own key: a panel
+    // and its category open independently, and dropping both in one blob would make
+    // collapsing a category look like it discarded the panels inside it.
+    const loadOpenP = () => {
+      try {
+        const raw = localStorage.getItem('zen.fxparams');
+        const a = raw ? JSON.parse(raw) : [];
+        return Array.isArray(a) ? a.filter(x => typeof x === 'string') : [];
+      } catch (e) { return []; }
+    };
+    const saveOpenP = keys => { try { localStorage.setItem('zen.fxparams', JSON.stringify([...new Set(keys)])); } catch (e) { /* quota */ } };
+    const paintGroups = open => groupBodies.forEach(g => {
+      const on = open.includes(g.name);
+      g.body.style.display = on ? 'block' : 'none';
+      g.head.classList.toggle('acc', on);
+      g.head.setAttribute('aria-expanded', on);
+      g.caret.textContent = on ? '⌃' : '⌄';
+    });
+    const toggleGroup = name => {
+      const open = loadOpen(), i = open.indexOf(name);
+      i >= 0 ? open.splice(i, 1) : open.push(name);
+      saveOpen(open); paintGroups(open);
+    };
     FX_GROUPS.forEach(([groupName, rows]) => {
-      const h = el('div', 'h2', esc(groupName));
-      h.style.cssText = 'margin:14px 0 2px;font-size:9.5px;opacity:.75';
-      fxlist.appendChild(h);
-      rows.forEach(([key, label, desc, heavy]) => {
+      const head = el('button', 'fxcat');
+      // leading chevron-well = "this opens", mixed-case label = demoted below the
+      // uppercase .h2 sections, trailing count = "this is a container of N"
+      head.innerHTML = `<span class="caret">⌄</span>`
+        + `<span class="nm">${esc(groupName.charAt(0) + groupName.slice(1).toLowerCase())}</span>`
+        + `<span class="cnt">${rows.length}</span>`;
+      fxlist.appendChild(head);
+      const gbody = el('div', 'fxcatbody');
+      gbody.style.display = 'none';
+      fxlist.appendChild(gbody);
+      groupBodies.push({ name: groupName, body: gbody, head, caret: head.querySelector('.caret') });
+      // whole row toggles just this category; the others keep their own state
+      head.onclick = () => { toggleGroup(groupName); blip(760); };
+      rows.forEach(([key, label, desc, heavy, noToggle]) => {
         const hasParams = !!(FX_SPECS[key] || []).length;
-        const row = el('div', 'fxrow');
-        row.innerHTML = `<div class="fxl"><div class="t">${esc(label)}${heavy ? ' <span class="chip" style="font-size:8.5px">heavier</span>' : ''}</div>
+        const row = el('div', 'fxrow' + (hasParams ? ' hasx' : ''));
+        row.innerHTML = `<div class="fxl"><div class="t">${esc(label)}${heavy ? ' <span class="chip am" style="font-size:8.5px">heavier</span>' : ''}</div>
             <div class="d">${esc(desc)}</div></div>
-          ${hasParams ? '<button class="btn ghost sm fxexp" title="Settings for this effect">⌄</button>' : ''}
-          <button class="tgl ${s[key] ? 'on' : ''}" data-fx="${key}"></button>`;
-        row.querySelector('.tgl').onclick = e => {
-          const on = !Settings.load()[key];
-          Settings.set(key, on);
-          e.target.classList.toggle('on', on);
-          blip(on ? 920 : 520);
-        };
-        fxlist.appendChild(row);
+          ${hasParams ? '<button class="btn ghost sm fxexp" aria-expanded="false" title="Settings for this effect">⌄</button>' : ''}
+          ${noToggle ? '' : `<button class="tgl ${s[key] ? 'on' : ''}" data-fx="${key}"></button>`}`;
+        if (!noToggle) {
+          row.querySelector('.tgl').onclick = e => {
+            e.stopPropagation();   // a toggle flip must never collapse/expand the row
+            const on = !Settings.load()[key];
+            Settings.set(key, on);
+            e.target.classList.toggle('on', on);
+            blip(on ? 920 : 520);
+          };
+        }
+        gbody.appendChild(row);
         if (hasParams) {
           const panel = el('div', 'fxparams');
+          panel.dataset.fx = key;   // so a preset can find and refresh the ones left open
           panel.style.cssText = 'display:none;padding:2px 0 10px 12px;margin:-2px 0 4px;'
             + 'border-left:2px solid color-mix(in srgb,var(--acc) 30%,transparent)';
-          fxlist.appendChild(panel);
+          gbody.appendChild(panel);
           let built = false;
-          row.querySelector('.fxexp').onclick = e => {
-            const open = panel.style.display === 'none';
+          const exp = row.querySelector('.fxexp');
+          const setOpen = (open, remember) => {
             if (open && !built) { buildParams(key, panel); built = true; }   // build on first open
             panel.style.display = open ? 'block' : 'none';
-            e.target.textContent = open ? '⌃' : '⌄';
+            exp.textContent = open ? '⌃' : '⌄';
+            exp.setAttribute('aria-expanded', open);
+            if (remember) saveOpenP(open ? loadOpenP().concat([key])
+                                        : loadOpenP().filter(k => k !== key));
           };
+          // Restore a panel the user left open. The drawer is rebuilt from scratch on
+          // every open, so without this an expanded config silently closes itself the
+          // moment you look away — the same complaint the category accordion had, one
+          // level down. Its category still governs visibility; this only governs the
+          // panel, so re-opening a category shows the same panels you left inside it.
+          if (loadOpenP().includes(key)) setOpen(true, false);
+          exp.onclick = e => {
+            e.stopPropagation();   // row-level click delegates here; don't bounce back
+            setOpen(panel.style.display === 'none', true);
+          };
+          row.onclick = () => exp.click();   // the whole row is the expander's hit area
         }
       });
     });
+    paintGroups(loadOpen());   // restore whichever categories were left open
+    body.querySelector('#fxfoldall').onclick = () => { saveOpen([]); paintGroups([]); blip(520); };
 
     // slider plumbing: accent track fill (--p) + value flash on change
     const paintR = r => r.style.setProperty('--p', ((r.value - r.min) / ((r.max - r.min) || 1) * 100) + '%');
@@ -6004,11 +6122,8 @@ const SettingsApp = {
     };
     const x1 = v => v.toFixed(1) + '×', x2 = v => v.toFixed(2) + '×', px = v => v + 'px';
     const fxSyncs = [
-      slider('sxden', 'starDensity', x1),
-      slider('sxbri', 'starBrightness', x1),
-      slider('sxglow', 'glowLevel', x2),
-      slider('sxfxi', 'fxIntensity', x2),
-    ];
+      slider('sxfxi', 'fxIntensity', x2),   // the one genuinely global dial; the rest
+    ];                                      // now live in their own effect's panel
     // ---- flyby cast, custom sprites, and custom background media -----------------
     const uploadMedia = (file, cb) => {
       const fr = new FileReader();
@@ -6096,10 +6211,10 @@ const SettingsApp = {
       host.replaceChildren();
       if (!list.length) { host.appendChild(el('div', 'd', 'none yet')); return; }
       list.forEach(m => {
-        const row = el('div', 'fxrow');
+        const row = el('div', 'fxrow hasx');
         row.innerHTML = `<img src="${esc(m.url)}" alt="" style="width:30px;height:30px;object-fit:cover;border-radius:4px;margin-right:8px">
           <div class="fxl grow"><div class="t">${esc(m.name || 'layer')}</div></div>
-          <button class="btn ghost sm" data-a="cfg">⌄</button>
+          <button class="btn ghost sm" data-a="cfg" aria-expanded="false">⌄</button>
           <button class="btn ghost sm" data-a="del">✕</button>
           <button class="tgl ${m.on !== false ? 'on' : ''}" data-a="on"></button>`;
         host.appendChild(row);
@@ -6135,16 +6250,22 @@ const SettingsApp = {
         chips('Blend', MEDIA_BLEND, 'blend', 'screen');
         chips('Motion', MEDIA_MOTION, 'motion', 'none');
         rng('Motion speed', 'speed', 0.2, 4, 0.1, 1, v => v.toFixed(1) + '×');
-        row.querySelector('[data-a=cfg]').onclick = e => {
+        const cfg = row.querySelector('[data-a=cfg]');
+        cfg.onclick = e => {
+          e.stopPropagation();   // row-level click delegates here; don't bounce back
           const open = panel.style.display === 'none';
           panel.style.display = open ? 'block' : 'none';
-          e.target.textContent = open ? '⌃' : '⌄';
+          cfg.textContent = open ? '⌃' : '⌄';
+          cfg.setAttribute('aria-expanded', open);
         };
+        row.onclick = () => cfg.click();   // the whole row is the expander's hit area
         row.querySelector('[data-a=on]').onclick = e => {
+          e.stopPropagation();   // a toggle flip must never collapse/expand the row
           const on = m.on === false;
           setMedia(m.id, { on }); m.on = on; e.target.classList.toggle('on', on);
         };
-        row.querySelector('[data-a=del]').onclick = async () => {
+        row.querySelector('[data-a=del]').onclick = async e => {
+          e.stopPropagation();
           await jpost('/api/fx/media/delete', { name: m.file });
           Settings.set('fxMedia', (Settings.load().fxMedia || []).filter(o => o.id !== m.id));
           if (typeof renderFXMedia === 'function') renderFXMedia();
@@ -6168,6 +6289,13 @@ const SettingsApp = {
       Settings.preset(b.dataset.preset);
       fxlist.querySelectorAll('.tgl').forEach(t => t.classList.toggle('on', !!Settings.load()[t.dataset.fx]));
       syncSliders();
+      // a preset rewrites the `top` params (star density, brightness, glow), so any
+      // panel sitting open is now showing stale numbers — rebuild those in place
+      fxlist.querySelectorAll('.fxparams').forEach(p => {
+        if (p.style.display !== 'none' && p.childElementCount) {
+          p.replaceChildren(); buildParams(p.dataset.fx, p);
+        }
+      });
       toast('preset: ' + b.dataset.preset, 'ok');
     });
     const markScale = () => body.querySelectorAll('[data-scale]').forEach(b =>
@@ -6363,8 +6491,9 @@ const SettingsApp = {
       const sync = () => { const cur = Settings.load()[key];
         r.value = cur != null ? cur : def;
         v.textContent = cur != null ? fmt(+cur) : 'theme';
+        v.classList.toggle('def', cur == null);   // "theme" = no override — faint, not accent
         r.style.setProperty('--p', ((r.value - r.min) / ((r.max - r.min) || 1) * 100) + '%'); };
-      r.oninput = () => { Settings.set(key, +r.value); v.textContent = fmt(+r.value); flashV(v);
+      r.oninput = () => { Settings.set(key, +r.value); v.textContent = fmt(+r.value); v.classList.remove('def'); flashV(v);
         r.style.setProperty('--p', ((r.value - r.min) / ((r.max - r.min) || 1) * 100) + '%'); };
       sync(); return sync;
     };
@@ -6390,9 +6519,11 @@ const SettingsApp = {
         fg.value = s2.termFg || t.fg; bg.value = s2.termBg || t.bg;
         fgv.textContent = s2.termFg ? s2.termFg : 'theme';
         bgv.textContent = s2.termBg ? s2.termBg : 'theme';
+        fgv.classList.toggle('def', !s2.termFg);
+        bgv.classList.toggle('def', !s2.termBg);
       };
-      fg.oninput = () => { Settings.set('termFg', fg.value); fgv.textContent = fg.value; };
-      bg.oninput = () => { Settings.set('termBg', bg.value); bgv.textContent = bg.value; };
+      fg.oninput = () => { Settings.set('termFg', fg.value); fgv.textContent = fg.value; fgv.classList.remove('def'); };
+      bg.oninput = () => { Settings.set('termBg', bg.value); bgv.textContent = bg.value; bgv.classList.remove('def'); };
       body.querySelector('#sxtermreset').onclick = () => {
         Settings.set('termFg', null); Settings.set('termBg', null);
         Theme.apply(Theme.current()); syncTerm(); toast('terminal: theme default', 'ok');
@@ -6410,12 +6541,11 @@ const SettingsApp = {
       const on = new Set(ext.enabled || []);
       const vis = ext.visible !== false;
       box.innerHTML = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">${regChip}
-          <button class="btn ghost sm" id="slinstall" style="margin-left:auto" title="replace it with ZENITH's own statusline (yours is backed up first)">USE ZENITH'S INSTEAD</button></div>
-        <div class="d" style="margin-bottom:8px">Editing <code>${esc(ext.configPath || '')}</code> — the status line at the bottom of your Claude sessions. Changes apply on its next render (they take effect per prompt, no restart).</div>
-        <label style="display:flex;gap:8px;align-items:center;margin:10px 0;cursor:pointer">
-          <input type="checkbox" id="slvisible" style="width:auto" ${vis ? 'checked' : ''}>
-          <span><b>Show the status line in sessions</b>
-            <span class="small" style="display:block;color:var(--dim)">Off empties all four lines so nothing renders; your selection is remembered and restored when you turn it back on.</span></span></label>
+          <button class="btn warn sm" id="slinstall" style="margin-left:auto" title="replace it with ZENITH's own statusline (yours is backed up first)">USE ZENITH'S INSTEAD</button></div>
+        <div class="note" style="margin:0 0 8px"><div class="d">Editing <code>${esc(ext.configPath || '')}</code> — the status line at the bottom of your Claude sessions. Changes apply on its next render (they take effect per prompt, no restart).</div></div>
+        <div class="fxrow" style="border:none;padding-left:0"><div class="fxl"><div class="t">Show the status line in sessions</div>
+          <div class="d">Off empties all four lines so nothing renders; your selection is remembered and restored when you turn it back on.</div></div>
+          <button class="tgl ${vis ? 'on' : ''}" id="slvisible"></button></div>
         <div id="slbody" style="${vis ? '' : 'opacity:.45'}">
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
             <span class="klabel" style="margin:0">data points</span>
@@ -6425,7 +6555,7 @@ const SettingsApp = {
           </div>
           <div id="slwidgets"></div>
         </div>
-        <button class="btn acc sm" id="slsave" style="margin-top:8px">▶ SAVE</button>`;
+        <button class="btn primary sm" id="slsave" style="margin-top:8px">SAVE</button>`;
       const wbox = box.querySelector('#slwidgets');
       wbox.innerHTML = LINES.map(ln =>
         `<div style="margin-bottom:7px" data-line="${ln}">
@@ -6438,6 +6568,7 @@ const SettingsApp = {
         const n = wbox.querySelectorAll('button.sel').length;
         countEl.textContent = n + ' of ' + (ext.catalog || []).length + ' on'
           + (n === 0 ? ' — nothing will render' : '');
+        countEl.classList.toggle('warn0', n === 0);
       };
       wbox.querySelectorAll('button').forEach(b => b.onclick = () => {
         b.classList.toggle('sel'); syncCount();
@@ -6458,17 +6589,19 @@ const SettingsApp = {
         return out;
       };
       const slvisible = box.querySelector('#slvisible');
-      slvisible.onchange = async () => {            // master switch saves instantly
-        box.querySelector('#slbody').style.opacity = slvisible.checked ? '' : '.45';
+      const visOn = () => slvisible.classList.contains('on');
+      slvisible.onclick = async () => {            // master switch saves instantly
+        slvisible.classList.toggle('on');
+        box.querySelector('#slbody').style.opacity = visOn() ? '' : '.45';
         const res = await jpost('/api/statusline/external',
-          { visible: slvisible.checked, lines: readLines() });
-        if (res) toast('status line ' + (slvisible.checked ? 'shown' : 'hidden'), 'ok');
+          { visible: visOn(), lines: readLines() });
+        if (res) toast('status line ' + (visOn() ? 'shown' : 'hidden'), 'ok');
       };
       box.querySelector('#slsave').onclick = async () => {
         const lines = readLines();
         const n = LINES.reduce((a, ln) => a + lines[ln].length, 0);
         const res = await jpost('/api/statusline/external',
-          { lines, visible: slvisible.checked });
+          { lines, visible: visOn() });
         if (res) toast('saved · ' + n + ' data points', 'ok');
       };
       box.querySelector('#slinstall').onclick = async () => {
@@ -6500,13 +6633,12 @@ const SettingsApp = {
       const LINE_NAMES = { 1: 'line 1 — session', 2: 'line 2 — context',
         3: 'line 3 — cost', 4: 'line 4 — system' };
       box.innerHTML = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">${regChip}
-          <button class="btn acc sm" id="slinstall" style="margin-left:auto">${reg === 'zenith' ? 'REINSTALL' : 'INSTALL'}</button>
-          <button class="btn ghost sm" id="sluninstall" ${reg === 'none' ? 'disabled' : ''}>UNINSTALL</button></div>
-        <div class="d" style="margin-bottom:8px">Renders at the bottom of each Claude session. Install writes ZENITH's statusline into ~/.claude/settings.json (any existing one is backed up).</div>
-        <label style="display:flex;gap:8px;align-items:center;margin:10px 0;cursor:pointer">
-          <input type="checkbox" id="slvisible" style="width:auto" ${vis ? 'checked' : ''}>
-          <span><b>Show the status line in sessions</b>
-            <span class="small" style="display:block;color:var(--dim)">Off hides it everywhere without uninstalling — flip back on any time. Applies to the next render in each session.</span></span></label>
+          <button class="btn ${reg === 'zenith' ? 'acc' : 'primary'} sm" id="slinstall" style="margin-left:auto">${reg === 'zenith' ? 'REINSTALL' : 'INSTALL'}</button>
+          <button class="btn danger sm" id="sluninstall" ${reg === 'none' ? 'disabled' : ''}>UNINSTALL</button></div>
+        <div class="note" style="margin:0 0 8px"><div class="d">Renders at the bottom of each Claude session. Install writes ZENITH's statusline into ~/.claude/settings.json (any existing one is backed up).</div></div>
+        <div class="fxrow" style="border:none;padding-left:0"><div class="fxl"><div class="t">Show the status line in sessions</div>
+          <div class="d">Off hides it everywhere without uninstalling — flip back on any time. Applies to the next render in each session.</div></div>
+          <button class="tgl ${vis ? 'on' : ''}" id="slvisible"></button></div>
         <div id="slbody" style="${vis ? '' : 'opacity:.45'}">
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
             <span class="klabel" style="margin:0">data points</span>
@@ -6516,7 +6648,7 @@ const SettingsApp = {
           </div>
           <div id="slwidgets"></div>
         </div>
-        <button class="btn sm" id="slsave" style="margin-top:8px">▶ SAVE</button>`;
+        <button class="btn primary sm" id="slsave" style="margin-top:8px">SAVE</button>`;
       const wbox = box.querySelector('#slwidgets');
       wbox.innerHTML = Object.keys(byLine).sort().map(ln =>
         `<div style="margin-bottom:7px"><div class="small" style="color:var(--dim);margin-bottom:3px">${esc(LINE_NAMES[ln] || 'line ' + ln)}</div>`
@@ -6528,6 +6660,7 @@ const SettingsApp = {
         const n = wbox.querySelectorAll('button.sel').length;
         countEl.textContent = n + ' of ' + (r.catalog || []).length + ' on'
           + (n === 0 ? ' — nothing will render' : '');
+        countEl.classList.toggle('warn0', n === 0);
       };
       wbox.querySelectorAll('button').forEach(b => b.onclick = () => {
         b.classList.toggle('sel'); syncCount();
@@ -6540,15 +6673,17 @@ const SettingsApp = {
       };
       syncCount();
       const slvisible = box.querySelector('#slvisible');
-      slvisible.onchange = async () => {          // master switch saves instantly
-        box.querySelector('#slbody').style.opacity = slvisible.checked ? '' : '.45';
-        const res = await jpost('/api/statusline', { visible: slvisible.checked });
-        if (res) toast('status line ' + (slvisible.checked ? 'shown' : 'hidden'), 'ok');
+      const visOn = () => slvisible.classList.contains('on');
+      slvisible.onclick = async () => {          // master switch saves instantly
+        slvisible.classList.toggle('on');
+        box.querySelector('#slbody').style.opacity = visOn() ? '' : '.45';
+        const res = await jpost('/api/statusline', { visible: visOn() });
+        if (res) toast('status line ' + (visOn() ? 'shown' : 'hidden'), 'ok');
       };
       box.querySelector('#slsave').onclick = async () => {
         const en = [...wbox.querySelectorAll('button.sel')].map(b => b.dataset.w);
         const res = await jpost('/api/statusline', { enabled: en, options: r.options || {},
-          visible: slvisible.checked });
+          visible: visOn() });
         if (res) toast('statusline saved · ' + en.length + ' data points', 'ok');
       };
       box.querySelector('#slinstall').onclick = async () => {
@@ -6627,19 +6762,20 @@ const SettingsApp = {
                 style="flex:1;min-width:0"${isEnv ? ' readonly' : ''}>${badge}</div>`;
           }).join('');
         }
-        return `<div class="intcard card" data-int="${spec.id}">
+        return `<div class="intcard card" data-int="${spec.id}" data-st="${dotOf(cap)}">
           <div class="introw"><span class="idot ${dotOf(cap)}"></span>
             <div class="grow"><div class="t">${esc(spec.name)}</div>
               <div class="d idetail">${esc(cap ? (cap.detail || '') : 'status unavailable')}</div></div>
-            <div class="btnrow" style="margin:0;flex:none">${modeBtns}</div></div>
+            <div class="btnrow seg" style="margin:0;flex:none">${modeBtns}</div></div>
           ${fieldsHTML}
-          <div style="margin-top:8px;text-align:right"><button class="btn sm acc" data-save="${spec.id}">▶ SAVE</button></div>
+          <div style="margin-top:8px;text-align:right"><button class="btn sm primary" data-save="${spec.id}">SAVE</button></div>
         </div>`;
       };
-      const top = `<div style="display:flex;align-items:center;margin-bottom:10px;gap:10px">
-          <div class="d" style="flex:1">Per-integration mode &amp; connection. Detected services appear automatically; force with ON, hide with OFF.</div>
-          <button class="btn sm" id="intwizard" style="flex:none">⚙ RUN SETUP AGAIN</button>
-          <button class="btn sm" id="intredetect" style="flex:none">↻ RE-DETECT ALL</button></div>`;
+      const top = `<div class="note" style="margin:0 0 8px"><div class="d">Per-integration mode &amp; connection.
+          Detected services appear automatically; force with ON, hide with OFF.</div></div>
+        <div class="btnrow" style="margin:0 0 12px;justify-content:flex-end">
+          <button class="btn ghost sm" id="intwizard">⚙ RUN SETUP AGAIN</button>
+          <button class="btn ghost sm" id="intredetect">↻ RE-DETECT ALL</button></div>`;
       box.replaceChildren(el('div', '', top + INTS.map(cardHTML).join('')));
       // mode segmented control: clicking a mode lights it (persisted on SAVE)
       box.querySelectorAll('.intcard .btnrow [data-mode]').forEach(b => b.onclick = () => {
@@ -6647,6 +6783,7 @@ const SettingsApp = {
       });
       const paintDot = (card, st) => {
         card.querySelector('.idot').className = 'idot ' + dotOf(st);
+        card.dataset.st = dotOf(st);   // keep the card's status stripe in step with its dot
         card.querySelector('.idetail').textContent = st ? (st.detail || '') : 'status unavailable';
       };
       // per-card SAVE: post only this card's patch (mode + editable fields; empty token omitted),
@@ -6686,7 +6823,7 @@ const SettingsApp = {
       };
       // MODULES grid (§5.5): built from APPS (excl. Settings); state lives server-side in config.modules.
       const modWrap = el('div', '', `<div class="h2">MODULES</div>
-        <div class="d" style="margin-bottom:6px">Show or hide dock modules. Hidden modules leave the dock, palette and saved layout.</div>`);
+        <div class="note" style="margin:0 0 6px"><div class="d">Show or hide dock modules. Hidden modules leave the dock, palette and saved layout.</div></div>`);
       const grid = el('div', 'modgrid');
       const modCfg = cfg.modules || {};
       (typeof APPS !== 'undefined' ? APPS : []).filter(a => a.id !== 'settings').forEach(a => {
@@ -6720,7 +6857,7 @@ const SettingsApp = {
           right = `<span class="chip">not needed on ${esc(p.system)}</span>`;
         else if (d.system && !d.installable)
           right = `<span class="chip am">no package manager</span>`;
-        else right = `<button class="btn acc sm" data-inst="${esc(key)}">INSTALL</button>`;
+        else right = `<button class="btn warn sm" data-inst="${esc(key)}">INSTALL</button>`;
         const need = d.needed ? ' <span class="chip am">required</span>' : '';
         // A missing system dep states the CONSEQUENCE, not a vague "recommended" —
         // tmux going missing silently costs you every session on the next restart.
@@ -6728,13 +6865,13 @@ const SettingsApp = {
           ? `<div class="d wrap" style="color:var(--amber);margin-top:3px">⚠ ${esc(d.impact)}</div>` : '';
         const manual = (!d.installed && d.system && !d.installable && d.manual)
           ? `<div class="d wrap" style="margin-top:3px">install it with: <code>${esc(d.manual)}</code></div>` : '';
-        return `<div class="row"><div class="grow"><div class="t">${esc(key)}${need}</div>
+        return `<div class="row noclick"><div class="grow"><div class="t">${esc(key)}${need}</div>
           <div class="d">${esc(d.purpose)}</div>${impact}${manual}</div>
           <div style="flex:none">${right}</div></div>`;
       };
       // system deps first — they're the ones with teeth
       const sysDeps = p.sys_deps || {};
-      box.innerHTML = `<div class="d" style="margin-bottom:8px">${esc(p.system)} · ${esc((p.python || '').split(/[\\/]/).pop())}</div>
+      box.innerHTML = `<div class="small" style="margin-bottom:8px;letter-spacing:.08em">${esc(p.system)} · ${esc((p.python || '').split(/[\\/]/).pop())}</div>
         ${Object.entries(sysDeps).map(([k, d]) => depRow(k, d)).join('')}
         ${Object.entries(p.deps).map(([k, d]) => depRow(k, d)).join('')}
         <div id="instout"></div>`;
