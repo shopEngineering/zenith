@@ -40,7 +40,12 @@ done
 # Runtime payload only. data/ is deliberately absent: it holds config.json,
 # gpu_nodes.json, deploy.env and the event store — machine state the repo must
 # never overwrite.
-FILES=(server.py zenith_agents.py zenith_store.py launch-zenith.sh VERSION)
+#
+# This list is EXHAUSTIVE: a new top-level module must be added here, or the
+# deployed server.py imports something that isn't on the target. The self-check
+# catches it and rolls the whole payload back, so nothing breaks — but the deploy
+# fails. zenith_cases.py cost exactly one such round-trip on 2026-08-14.
+FILES=(server.py zenith_agents.py zenith_store.py zenith_cases.py launch-zenith.sh VERSION)
 DIRS=(static scripts defaults bin)
 
 c(){ printf '\033[%sm%s\033[0m' "$1" "$2"; }
@@ -99,7 +104,36 @@ step "deploy → $DEST"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BAK="$DEST/server.py.bak-$STAMP-predeploy"
 cp -p "$DEST/server.py" "$BAK"
-ok "backup → $(basename "$BAK")"
+
+# Snapshot EVERYTHING about to be overwritten, not just server.py. $DEST is a
+# plain directory, not a checkout, so an edit made there has no other copy
+# anywhere — and static/ was previously replaced with no backup at all. That
+# asymmetry cost a night's frontend work: a deploy silently overwrote
+# static/app.js, static/apps.js and static/index.html, and there was nothing to
+# restore from. Cheap insurance (~1.5 MB a deploy) against an unrecoverable loss.
+SNAP="$DEST/.predeploy/$STAMP"
+mkdir -p "$SNAP"
+SNAP_N=0
+for f in "${FILES[@]}"; do
+  [ -f "$DEST/$f" ] || continue
+  mkdir -p "$SNAP/$(dirname "$f")"
+  cp -p "$DEST/$f" "$SNAP/$f"; SNAP_N=$((SNAP_N + 1))
+done
+for d in "${DIRS[@]}"; do
+  [ -d "$DEST/$d" ] || continue
+  while IFS= read -r f; do
+    rel="${f#"$DEST"/}"
+    mkdir -p "$SNAP/$(dirname "$rel")"
+    cp -p "$f" "$SNAP/$rel"; SNAP_N=$((SNAP_N + 1))
+  done < <(find "$DEST/$d" -type f ! -name '*.pyc' ! -name '.DS_Store')
+done
+ok "backup → $(basename "$BAK") + $SNAP_N file(s) in .predeploy/$STAMP"
+
+# Keep the last 10 snapshots. Unpruned these grow without bound, and the useful
+# one is always recent — anything older is in git.
+while IFS= read -r old; do rm -rf "$old"; done < <(
+  find "$DEST/.predeploy" -mindepth 1 -maxdepth 1 -type d | sort -r | tail -n +11)
+
 for f in "${FILES[@]}"; do
   [ -f "$SRC/$f" ] && cp -p "$SRC/$f" "$DEST/$f"
 done
@@ -122,9 +156,18 @@ ok "copied"
 # --- verify the DEPLOYED copy, roll back if it is broken ---------------------
 step "verify deployed copy"
 if ! ( cd "$DEST" && "$PY" -m py_compile server.py && "$PY" server.py check ); then
-  cp -p "$BAK" "$DEST/server.py"
-  die "deployed server.py failed its checks — server.py rolled back from $(basename "$BAK")
-     (static assets were still copied; re-run once the Python side is fixed)"
+  # Roll the WHOLE payload back, not just server.py. Restoring Python while
+  # leaving the new static assets in place leaves the daemon serving a frontend
+  # its backend does not implement — a combination neither half was tested in.
+  # (Files the deploy ADDED are left behind; nothing references them once the
+  # rest is reverted.)
+  while IFS= read -r f; do
+    rel="${f#"$SNAP"/}"
+    mkdir -p "$DEST/$(dirname "$rel")"
+    cp -p "$f" "$DEST/$rel"
+  done < <(find "$SNAP" -type f)
+  die "deployed server.py failed its checks — the whole payload was rolled back
+     from .predeploy/$STAMP (server.py also kept at $(basename "$BAK"))"
 fi
 ok "compiles + self-check passes"
 

@@ -89,10 +89,6 @@ function openSetupWizard() {
   if (document.querySelector('.wizard-scrim')) return;   // singleton — one wizard at a time
 
   const SPEC = [
-    { id: 'nexusmind', name: 'NexusMind memory', fields: [
-      { k: 'sqlite_db', label: 'SQLite path', ph: '~/…/nexusprime.db', env: 'ZENITH_NM_DB' },
-      { k: 'pg_dsn', label: 'Postgres DSN', ph: 'postgresql://…', env: 'ZENITH_NM_PG' },
-      { k: 'capture_project_dir', label: 'Capture dir', ph: '~/claudeProjects/NexusPrime' }] },
     { id: 'nexusmind_api', name: 'NexusMind API', fields: [
       { k: 'base_url', label: 'Base URL', ph: 'http://127.0.0.1:5055', env: 'ZENITH_NM_API' },
       { k: 'token', label: 'Token', pw: true, env: 'ZENITH_NM_TOKEN' },
@@ -1741,13 +1737,13 @@ const MemoryApp = {
     const wrap = body.querySelector('#nmwrap');
     const tabs = body.querySelectorAll('.tab');
     let meta = null;
-    const ensureMeta = async () => { if (!meta) meta = await apiSafe('/api/memory/meta', undefined, { silent: true }); return meta; };
+    const ensureMeta = async () => { if (!meta || !meta.available) meta = await apiSafe('/api/memory/meta', undefined, { silent: true }); return meta; };
 
     // source badge (postgres/sqlite · N memories)
     apiSafe('/api/memory/source', undefined, { silent: true }).then(r => {
       const b = body.querySelector('#nmsrc'); if (!b) return;
       if (r && r.backend) { b.textContent = r.backend + ' · ' + fmtNum(r.memories_total ?? r.total ?? 0);
-        b.className = 'chip ' + (r.backend === 'postgres' ? 'on' : 'am'); }
+        b.className = 'chip ' + (r.backend && r.backend !== 'none' ? 'on' : 'am'); }
       else { b.textContent = 'store'; b.className = 'chip'; }
     });
 
@@ -1992,6 +1988,395 @@ const MemoryApp = {
     tabs.forEach(t => t.onclick = () => { if (t.dataset.t) switchTab(t.dataset.t); });
     showNM();
   }
+};
+
+/* ================= NexusMind command terminal =================
+   A port of NexusMind's own dashboard command pane (templates/index.html #cmd-pane +
+   static/app.js runCmd/cmd*), structure and command semantics preserved, restyled into
+   ZENITH's visual language. Two deliberate differences from the original:
+
+     1. a mic button, wired to the existing Voice.toggle (app.js) — no audio code here;
+     2. EVERY backing call goes through ZENITH's server-side nm_api() proxy
+        (/api/memory/*), never a direct fetch to NexusMind. NexusMind's page calls its
+        own origin; ZENITH must not — the bearer token stays server-side and the whole
+        surface honours the `nexusmind_api` integration switch.
+
+   Commands NexusMind implements against endpoints ZENITH does not proxy (prompt:, goal:,
+   ref:, refs, share:, summarize:, report:, theme:, bare URLs, sync_*) answer with an
+   explicit "run it in the NexusMind dashboard" line rather than silently falling through
+   to ask: and pretending they did something. */
+
+// prefix -> [type, namespace, tags]. Verbatim from NexusMind's runCmd, plus `req:` —
+// ZENITH's ⌘K bar already accepts req: (CAPTURE_PREFIXES), so the two surfaces speak the
+// same grammar instead of one quietly understanding a word the other doesn't.
+const NM_TYPED = {
+  'idea:': ['idea', 'work', ['idea', 'backlog']],
+  'todo:': ['todo', 'work', ['todo', 'backlog']],
+  'bug:': ['bug-fix', 'work', ['bug-fix']],
+  'decision:': ['decision', 'work', ['decision']],
+  'note:': ['note', 'work', ['note']],
+  'q:': ['todo', 'work', ['queue', 'backlog']],
+  'feature:': ['backlog', 'work', ['feature', 'backlog']],
+  'module:': ['project', 'work', ['module', 'architecture']],
+  'task:': ['todo', 'work', ['task', 'backlog']],
+  'project:': ['project', 'work', ['project']],
+  'test:': ['todo', 'work', ['test', 'qa']],
+  'research:': ['research', 'research', ['research']],
+  'lesson:': ['lesson', 'work', ['lesson']],
+  'release:': ['release', 'work', ['release']],
+  'deploy:': ['release', 'work', ['release', 'deployment']],
+  'contact:': ['contact', 'personal', ['contact', 'person']],
+  'event:': ['event', 'personal', ['event', 'calendar']],
+  'health:': ['health', 'health', ['health']],
+  'expense:': ['financial', 'personal', ['financial', 'expense']],
+  'risk:': ['lesson', 'work', ['risk', 'lesson']],
+  'blocker:': ['bug-fix', 'work', ['blocker', 'bug-fix']],
+  'requirement:': ['backlog', 'work', ['requirement', 'feature']],
+  'req:': ['backlog', 'work', ['requirement', 'feature']],
+  'credential:': ['credential', 'work', ['credential', 'sensitive']],
+  'secret:': ['credential', 'work', ['credential', 'sensitive']],
+  'process:': ['process', 'work', ['process', 'knowledge']],
+  'sop:': ['process', 'work', ['process', 'knowledge']],
+  'howto:': ['process', 'work', ['process', 'knowledge']],
+  'snippet:': ['snippet', 'work', ['snippet']],
+  'code:': ['snippet', 'work', ['snippet']],
+  'meeting:': ['meeting-note', 'work', ['meeting-note', 'project']],
+  'feedback:': ['feedback', 'work', ['feedback']],
+  'review:': ['feedback', 'work', ['feedback']],
+  'bookmark:': ['bookmark', 'research', ['bookmark', 'backlog']],
+  'save-link:': ['bookmark', 'research', ['bookmark', 'backlog']],
+  'quote:': ['quote', 'personal', ['quote']],
+  'recipe:': ['recipe', 'personal', ['recipe']],
+  'reflection:': ['reflection', 'personal', ['reflection', 'lesson']],
+  'dream:': ['dream', 'personal', ['dream']],
+  'travel:': ['travel', 'personal', ['travel']],
+  'trip:': ['travel', 'personal', ['travel']],
+  'learning:': ['lesson', 'learning', ['lesson', 'learning']],
+  'til:': ['lesson', 'learning', ['lesson', 'learning']],
+  'client:': ['note', 'business', ['business']],
+  'business:': ['note', 'business', ['business']],
+  'creative:': ['idea', 'creative', ['creative']],
+  'design:': ['idea', 'creative', ['creative']],
+  'instruct_g:': ['preference', 'work', ['instruction', 'global']],
+  'instruct:': ['preference', 'work', ['instruction', 'session-scoped']],
+};
+const NM_INGEST_PREFIXES = ['ingest:', 'add:', 'remember:', 'save:', 'store:'];
+const NM_CORRECT_PREFIXES = ['correct:', 'fix:', 'update:'];
+// `show <word>` -> tag, verbatim from NexusMind.
+const NM_SHOW_TAGS = {
+  ideas: 'idea', todos: 'todo', tasks: 'task', bugs: 'bug-fix', decisions: 'decision',
+  notes: 'note', sessions: 'session', features: 'feature', projects: 'project',
+  tests: 'test', lessons: 'lesson', releases: 'release', goals: 'goal', risks: 'risk',
+  blockers: 'blocker', requirements: 'requirement', research: 'research', queue: 'queue',
+  instructions: 'instruction', contacts: 'contact', events: 'event', health: 'health',
+  expenses: 'financial', prompts: 'prompt',
+};
+// NexusMind commands whose endpoints ZENITH does not proxy. Named, never silently dropped.
+const NM_UNPROXIED = ['prompt:', 'goal:', 'ref:', 'share:', 'summarize:', 'summary:',
+                      'report:', 'theme:'];
+const NM_UNPROXIED_WORDS = ['refs', 'references', 'sync_status', 'sync status',
+                            'sync_now', 'sync now', 'sync_conflicts', 'sync conflicts',
+                            'sync_add_peer', 'sync add peer', 'pair'];
+
+const nmA = h => '<div class="nm-a">' + h + '</div>';
+const nmMuted = h => '<div class="nm-a muted">' + h + '</div>';
+const nmErr = h => '<div class="nm-a err">' + esc(h) + '</div>';
+// Every /api/memory/* answer carries {available, error}. One place turns that into a line,
+// so an unreachable NexusMind and a disabled integration read the same in every command.
+const nmGuard = r => (!r ? nmErr('no response from ZENITH')
+  : r.available === false ? nmErr(r.error || 'nexusmind unavailable')
+  : r.error ? nmErr(r.error) : null);
+
+async function nmPost(path, body, trace) {
+  const t0 = performance.now();
+  const r = await apiSafe(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body) }, { silent: true });
+  if (trace) trace(path, Math.round(performance.now() - t0), r);
+  return r;
+}
+async function nmGet(path, trace) {
+  const t0 = performance.now();
+  const r = await apiSafe(path, undefined, { silent: true });
+  if (trace) trace(path, Math.round(performance.now() - t0), r);
+  return r;
+}
+
+/* ---- the command implementations (one per NexusMind cmd*), all via /api/memory/* ---- */
+async function nmCmdAsk(question, trace) {
+  const r = await nmPost('/api/memory/ask', { question }, trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const sources = (r.sources || []).slice(0, 6);
+  // NM answers with a `context` bundle of [Memory: title] blocks joined by ---; strip the
+  // headers and the [Referenced …] file blocks, exactly as NexusMind's own pane does.
+  const raw = r.context || r.answer || '';
+  const answers = raw.split(/\n---\n/).map(b => b.trim()).filter(Boolean)
+    .filter(b => !b.startsWith('[Referenced'))
+    .map(b => b.replace(/^\[Memory:[^\]]*\]\n?/, '').trim()).filter(Boolean);
+  const joined = answers.join('\n\n');
+  if (!joined && !sources.length) return nmMuted('No results found.');
+  const display = joined.length > 500 ? joined.slice(0, 500) + '…' : joined;
+  const src = sources.map(s => '<span class="nm-src-i">[' + esc(s.type || '?') + '] '
+    + esc(String(s.title || s.path || '').slice(0, 40)) + '</span>').join(' · ');
+  return nmA(esc(display).replace(/\n/g, '<br>'))
+    + (sources.length ? '<div class="nm-src">' + sources.length + ' sources: ' + src + '</div>' : '');
+}
+
+async function nmCmdIngest(text, hints, trace) {
+  const r = await nmPost('/api/memory/ingest', hints ? { text, hints } : { text }, trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const cls = r.classification || {};
+  const type = cls.type || (hints && hints.type) || '?';
+  const ns = cls.namespace || (hints && hints.namespace) || '?';
+  const tags = cls.tags || (hints && hints.tags) || [];
+  return nmA((hints ? 'Stored as ' : 'Ingested as ') + '<span class="nm-k">[' + esc(type) + ']</span> in '
+    + '<span class="nm-ns">' + esc(ns) + '</span>'
+    + '<br>Key: ' + esc(r.key || '?')
+    + '<br>Tags: ' + esc(tags.join(', '))
+    + '<br>' + (hints ? '' : 'Action: ' + esc(r.dedup_action || 'new') + ' | ')
+    + 'Links: ' + (r.relationships_created || 0));
+}
+
+async function nmCmdCorrect(text, trace) {
+  const r = await nmPost('/api/memory/correct', { text }, trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  if (r.action === 'created_new')
+    return nmA('No matching memory found — stored as new.<br>Key: ' + esc(r.key || '?'));
+  return nmA('<span class="nm-ok">Corrected:</span> <span class="nm-k">' + esc(r.key || '?') + '</span>'
+    + '<br>Title: ' + esc(r.title || '')
+    + '<br>Old version archived: yes'
+    + '<br>Applied: ' + esc(r.correction_applied || ''));
+}
+
+const nmRows = mems => mems.map(m =>
+  '<span class="nm-k">' + esc(m.key) + '</span>: ' + esc(m.title || m.key)).join('<br>');
+
+async function nmCmdSearch(query, trace) {
+  const r = await nmGet('/api/memory?limit=80&q=' + encodeURIComponent(query), trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const mems = r.memories || [];
+  if (!mems.length) return nmMuted('No results for "' + esc(query) + '"');
+  return nmA(mems.length + ' results:<br>' + nmRows(mems.slice(0, 8)));
+}
+
+async function nmCmdShowTag(tag, trace) {
+  const r = await nmGet('/api/memory?limit=80&tag=' + encodeURIComponent(tag), trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const mems = r.memories || [];
+  if (!mems.length) return nmMuted('No items tagged "' + esc(tag) + '"');
+  return nmA(mems.length + ' items:<br>' + nmRows(mems.slice(0, 10)));
+}
+
+async function nmCmdRecent(trace) {
+  const r = await nmGet('/api/memory?limit=10', trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const mems = r.memories || [];
+  if (!mems.length) return nmMuted('No memories yet.');
+  return nmA(mems.map(m => '<span class="nm-k">' + esc(m.key) + '</span> ['
+    + esc(m.namespace || '') + '] ' + esc(m.title || m.key)).join('<br>'));
+}
+
+async function nmCmdNamespaces(trace) {
+  const r = await nmGet('/api/memory/meta', trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const ns = r.namespaces || [];
+  if (!ns.length) return nmMuted('No namespaces.');
+  return nmA(ns.map(n => esc(n.name) + ': ' + n.count).join('<br>'));
+}
+
+async function nmCmdStats(trace) {
+  const r = await nmGet('/api/memory/nmstats', trace);
+  const bad = nmGuard(r); if (bad) return bad;
+  const s = r.stats || {};
+  return nmA('Memories: ' + (s.total_memories ?? '?') + ' | Embedded: ' + (s.embedded ?? '?')
+    + ' (' + (s.embedding_coverage ?? '?') + '%)'
+    + '<br>Namespaces: ' + esc(JSON.stringify(s.namespaces ?? {}))
+    + '<br>Staleness: ' + esc(JSON.stringify(s.staleness ?? {})));
+}
+
+function nmCmdHelp() {
+  const K = k => '<span class="nm-k">' + k + '</span>';
+  return nmA(
+    '<span class="nm-h">── Ask &amp; Search ──</span><br>'
+    + K('ask:') + ' question — search all knowledge + synthesize an answer<br>'
+    + K('search') + ' / ' + K('find') + ' query — keyword/semantic search<br><br>'
+    + '<span class="nm-h">── Capture ──</span><br>'
+    + K('ingest:') + '/' + K('remember:') + '/' + K('add:') + ' text — auto-classify and store<br>'
+    + K('correct:') + '/' + K('fix:') + '/' + K('update:') + ' text — amend the matching memory<br>'
+    + Object.keys(NM_TYPED).map(p => K(p)).join(' ') + '<br><br>'
+    + '<span class="nm-h">── Show / List ──</span><br>'
+    + K('show') + ' ' + Object.keys(NM_SHOW_TAGS).join('|') + '<br>'
+    + K('list') + ' &lt;tag&gt; — any tag verbatim<br><br>'
+    + '<span class="nm-h">── System ──</span><br>'
+    + K('stats') + ' — corpus/embedding stats · ' + K('namespaces') + ' / ' + K('ns')
+    + ' — namespace breakdown · ' + K('recent') + ' — last 10 · ' + K('help') + '<br><br>'
+    + '<span class="nm-h">── Not proxied by ZENITH ──</span><br>'
+    + '<span class="nm-a muted">' + NM_UNPROXIED.concat(NM_UNPROXIED_WORDS).join(' ')
+    + ' — these run in the NexusMind dashboard (:5055), not through ZENITH.</span><br><br>'
+    + '<span class="nm-a muted">Anything else is treated as ask:</span>');
+}
+
+// One command in, one HTML block out. Mirrors NexusMind's runCmd dispatch order.
+async function nmRunCommand(raw, trace) {
+  const lower = raw.toLowerCase();
+  const unproxied = NM_UNPROXIED.find(p => lower.startsWith(p))
+    || NM_UNPROXIED_WORDS.find(w => lower === w || lower.startsWith(w + ' '))
+    || (/^https?:\/\/\S+$/i.test(raw) ? 'bare URL (share:)' : null);
+  if (unproxied)
+    return nmMuted('<b>' + esc(unproxied) + '</b> is not proxied by ZENITH — run it in the '
+      + 'NexusMind dashboard. ZENITH only proxies the ask / ingest / correct / search / '
+      + 'show / stats surface.');
+
+  const corr = NM_CORRECT_PREFIXES.find(p => lower.startsWith(p));
+  if (corr) return nmCmdCorrect(raw.slice(corr.length).trim(), trace);
+  if (lower.startsWith('ask:')) return nmCmdAsk(raw.slice(4).trim(), trace);
+  const ing = NM_INGEST_PREFIXES.find(p => lower.startsWith(p));
+  if (ing) return nmCmdIngest(raw.slice(ing.length).trim(), null, trace);
+  // longest prefix first so instruct_g: never loses to instruct:, save-link: to save:
+  const typed = Object.keys(NM_TYPED).filter(p => lower.startsWith(p))
+    .sort((a, b) => b.length - a.length)[0];
+  if (typed) {
+    const [type, namespace, tags] = NM_TYPED[typed];
+    return nmCmdIngest(raw.slice(typed.length).trim(), { type, namespace, tags }, trace);
+  }
+  if (/^(search|find)\s+/i.test(raw)) return nmCmdSearch(raw.replace(/^(search|find)\s+/i, ''), trace);
+  if (lower.startsWith('show ')) {
+    const what = lower.slice(5).trim();
+    return nmCmdShowTag(NM_SHOW_TAGS[what] || what, trace);
+  }
+  if (lower.startsWith('list ')) return nmCmdShowTag(lower.slice(5).trim(), trace);
+  if (lower === 'stats') return nmCmdStats(trace);
+  if (lower === 'namespaces' || lower === 'ns') return nmCmdNamespaces(trace);
+  if (lower === 'recent') return nmCmdRecent(trace);
+  if (lower === 'help' || lower === '?' || lower === 'memory_help' || lower === 'commands')
+    return nmCmdHelp();
+  return nmCmdAsk(raw, trace);          // default: treat as ask
+}
+
+const NM_HINT_CHIPS = ['ask: ', 'ingest: ', 'idea: ', 'todo: ', 'bug: ', 'decision: ',
+                       'correct: ', 'feature: ', 'search ', 'show ', 'stats', 'recent', 'help'];
+
+/* Build the terminal. Classes only, no ids — the window manager can hold more than one
+   NexusMind window and duplicate ids would cross-wire them. */
+function nmTerminal() {
+  const root = el('div', 'nm-term');
+  root.innerHTML = `
+    <div class="nm-term-bar">
+      <div class="nm-dots"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+      <span class="nm-term-title">NexusMind Terminal</span>
+      <button class="nm-term-clear" title="clear output">CLEAR</button>
+      <button class="nm-term-collapse" title="collapse">&#9650;</button>
+    </div>
+    <div class="nm-term-body">
+      <div class="nm-term-history"></div>
+      <div class="nm-term-verbose" style="display:none"></div>
+      <div class="nm-term-row">
+        <span class="nm-term-prompt">&#10095;</span>
+        <input class="nm-term-input" autocomplete="off" spellcheck="false"
+               placeholder="ask: what is EAP?  ·  idea: new dashboard  ·  show todos  ·  help">
+        <button class="nm-term-mic" title="voice input">&#127908;</button>
+        <label class="nm-term-vtoggle" title="show the proxy round-trip for each command">
+          <input type="checkbox"> <span>verbose</span></label>
+      </div>
+      <div class="nm-term-hints">${NM_HINT_CHIPS.map(c =>
+        `<span class="nm-chip" data-c="${esc(c)}">${esc(c.trim())}</span>`).join('')}</div>
+    </div>`;
+
+  const bar = root.querySelector('.nm-term-bar');
+  const history = root.querySelector('.nm-term-history');
+  const vlog = root.querySelector('.nm-term-verbose');
+  const vbox = root.querySelector('.nm-term-vtoggle input');
+  const input = root.querySelector('.nm-term-input');
+  const mic = root.querySelector('.nm-term-mic');
+  const clearBtn = root.querySelector('.nm-term-clear');
+
+  // collapse — clicking the titlebar toggles the body (Luke's "it can be collapsed")
+  const setCollapsed = on => {
+    root.classList.toggle('collapsed', on);
+    try { localStorage.setItem('zen.nmterm.collapsed', on ? '1' : '0'); } catch (e) { /* quota */ }
+    if (!on) input.focus();
+  };
+  bar.onclick = e => { if (e.target === clearBtn) return; setCollapsed(!root.classList.contains('collapsed')); };
+  setCollapsed(localStorage.getItem('zen.nmterm.collapsed') === '1');
+
+  // output pane: absent until something is asked for, and gone again when dismissed
+  const syncClear = () => clearBtn.style.display = history.children.length ? '' : 'none';
+  clearBtn.onclick = e => { e.stopPropagation(); history.innerHTML = ''; syncClear(); };
+  syncClear();
+
+  // verbose: NexusMind's own pane streams NM-side LLM op events (window 'nm-llm-op'), which
+  // ZENITH has no channel for. What ZENITH can honestly show is its OWN proxy round-trip,
+  // so that is what this logs — labelled as such, not dressed up as NM internals.
+  try { vbox.checked = localStorage.getItem('zen.nmterm.verbose') === '1'; } catch (e) { /* quota */ }
+  const syncVerbose = () => {
+    vlog.style.display = vbox.checked ? 'block' : 'none';
+    try { localStorage.setItem('zen.nmterm.verbose', vbox.checked ? '1' : '0'); } catch (e) { /* quota */ }
+  };
+  vbox.onchange = syncVerbose; syncVerbose();
+  const trace = (path, ms, r) => {
+    if (!vbox.checked) return;
+    const ok = r && r.available !== false && !r.error;
+    const row = el('div', 've ' + (ok ? 'ok' : 'err'));
+    row.innerHTML = `<span class="vtime">${new Date().toTimeString().slice(0, 8)}</span>`
+      + (ok ? '&#10003; ' : '&#9888; ') + esc(path) + ' <span class="vms">' + ms + 'ms</span>'
+      + (ok ? '' : ' — ' + esc((r && r.error) || 'failed'));
+    vlog.appendChild(row);
+    while (vlog.children.length > 40) vlog.removeChild(vlog.firstChild);
+    vlog.scrollTop = vlog.scrollHeight;
+  };
+
+  root.querySelectorAll('.nm-chip').forEach(c => c.onclick = () => {
+    input.value = c.dataset.c; input.focus();
+  });
+
+  const run = async () => {
+    const raw = input.value.trim();
+    if (!raw) return;
+    input.value = '';
+    const entry = el('div', 'nm-entry');
+    entry.innerHTML = '<div class="nm-q">&#8250; ' + esc(raw) + '</div>'
+      + '<div class="nm-a muted">Processing…</div>';
+    const x = el('button', 'nm-entry-x', '&#10005;');
+    x.title = 'dismiss';
+    x.onclick = () => { entry.remove(); syncClear(); };
+    entry.appendChild(x);
+    history.appendChild(entry);
+    syncClear();
+    history.scrollTop = history.scrollHeight;
+    let out;
+    try { out = await nmRunCommand(raw, trace); }
+    catch (e) { out = nmErr('Error: ' + (e && e.message ? e.message : String(e))); }
+    entry.innerHTML = '<div class="nm-q">&#8250; ' + esc(raw) + '</div>' + out;
+    entry.appendChild(x);
+    history.scrollTop = history.scrollHeight;
+  };
+  input.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); run(); } };
+
+  // mic — the existing streaming Voice object does all the work. Whatever is already
+  // typed (a chip prefix, usually) is kept as a prefix so "click idea: then dictate" works.
+  mic.onclick = () => {
+    if (Voice.active) { Voice.active.stop(); return; }
+    const head = input.value && !input.value.endsWith(' ') ? input.value + ' ' : input.value;
+    Voice.toggle(text => { input.value = head + text; }, mic);
+    input.focus();
+  };
+
+  return root;
+}
+
+/* NexusMind: its own dock button (I.memory). The command terminal is pinned at the top and
+   never scrolls away; MemoryApp's six tabs render below it, untouched — MemoryApp is still
+   the thing rendering them, so BROWSE/GRAPH/TIMELINE/STATS/CAPTURE/FILE MEM keep every
+   behaviour they had as the Docs module's Memory tab. */
+const NexusMindApp = {
+  id: 'memory', name: 'NexusMind', icon: I.memory, w: 1040, h: 720, accent: '#c084fc',
+  cls: 'mod-win',                       // makes .win-body a flex column, so the pin below works
+  render(body, win) {
+    body.innerHTML = '';
+    body.appendChild(nmTerminal());     // flex:none — pinned above the tabs
+    const host = el('div', 'nm-tabs-host');
+    body.appendChild(host);
+    MemoryApp.render(host, win);        // owns win.cleanup / win.sub, exactly as before
+  },
 };
 
 /* ================= Agents & Skills (v3: add/edit + editor) ================= */
@@ -5262,6 +5647,182 @@ const FeedApp = {
   }
 };
 
+/* ================= Cases (detectors over counted facts) ================= */
+const CASE_LABEL = {
+  waiting_on_you: 'WAITING ON YOU', burn_no_progress: 'BURN WITHOUT PROGRESS',
+  silent_stall: 'SILENT STALL', model_fanout: 'EXPENSIVE MODEL FAN-OUT',
+};
+const CASE_SEV = { high: 'rd', medium: 'am', low: '' };
+
+// Evidence is rendered from COUNTED fields only — never prose, never model
+// output. That is why a card still reads correctly when the GPU is busy.
+// Every accessor reads defensively: a missing/renamed evidence key degrades
+// the line (falls back to '?' / 0 / empty), it never throws and blanks the tab.
+const CASE_EVIDENCE = {
+  waiting_on_you: e => `waiting ${e.waited_minutes ?? '?'}m` +
+    (e.escalated ? ' · escalated' : '') + ` · ${e.prompts ?? 0} prompts · ${e.errors ?? 0} errors`,
+  burn_no_progress: e => `${fmtNum(e.delta_tok_out ?? 0)} tok · ${e.delta_files_edited ?? 0} files edited · ` +
+    `${e.window_minutes ?? '?'}m window (${e.samples ?? 0} samples)`,
+  silent_stall: e => `transcript frozen ${e.frozen_minutes ?? '?'}m · ${e.size ?? '?'} bytes` +
+    (e.mtime ? ` · mtime ${esc(String(e.mtime))}` : ''),
+  model_fanout: e => `${(e.matched_models || []).join(', ') || '?'} · ${e.subagents ?? '?'} subagents · ` +
+    `${fmtNum(e.tok_out ?? 0)} tok`,
+};
+
+// D4: the hover title, where a card's SECOND clock lives.
+//
+// Luke asked for both clocks on the card face. Having looked at what the
+// second one is, it is off the face and in here instead, and this is why.
+// The wait is measured from `sessions.last_ts` — the last event actually
+// written to the transcript — and that number is correct on its own; it does
+// not overstate and needs no companion to qualify it. The other number,
+// `watcher_row_age_minutes`, is how long since Session Watch last refreshed
+// its row. It is not a second opinion on the wait and it is not "transcript
+// touched" (the real file mtimes move without the file growing, so they mean
+// nothing here) — it is bookkeeping, and on old rows it UNDERSTATES the wait
+// by 4-10x. Printing it beside "waiting 47m" invites exactly the reading that
+// it is a truer, smaller wait; two review passes made that mistake already,
+// with the whole source file in front of them. A card that has to be
+// explained is worse than one honest number, so the face keeps the wait and
+// the audit trail lives one hover away, spelled out rather than abbreviated.
+const CASE_TITLE = {
+  waiting_on_you: e =>
+    `wait measured from the session's last transcript event (sessions.last_ts)` +
+    (e.watcher_row_age_minutes == null ? ''
+      : ` · Session Watch last refreshed this row ${e.watcher_row_age_minutes}m ago` +
+        ` (bookkeeping — not the wait, and not when the file was touched)`),
+};
+
+// The project filter dropdown is populated from State.projects, whose names
+// are bare ("floor-app"). A worktree session's case carries a project like
+// "floor-app · group-complete-switch" (zenith_cases.py project_name() joins
+// root name + " · " + worktree dir name). cases_query()'s project= is an
+// exact SQL match, so sending the bare name straight to the backend would
+// silently drop every worktree-suffixed case out of the result set (a tab
+// that looks empty but isn't). Filtering client-side against a prefix rule
+// keeps both bare and worktree-suffixed rows filed under their root project.
+const caseProjectMatches = (c, sel) => !sel || c.project === sel || (c.project || '').startsWith(sel + ' · ');
+
+const CasesApp = {
+  id: 'cases', name: 'Cases', icon: I.obs, w: 820, h: 600, accent: '#ff8c96',
+  render(body, win) {
+    body.innerHTML = `<div class="main" style="height:100%">
+      <div class="btnrow" style="margin:0 0 8px">
+        <select id="cdet" style="min-width:200px">
+          <option value="">all detectors</option>
+          <option value="waiting_on_you">waiting on you</option>
+          <option value="burn_no_progress">burn without progress</option>
+          <option value="silent_stall">silent stall</option>
+          <option value="model_fanout">expensive model fan-out</option>
+        </select>
+        <select id="cproj" style="min-width:180px"><option value="">all projects</option></select>
+      </div>
+      <div id="clist"></div></div>`;
+    const list = body.querySelector('#clist');
+    const detSel = body.querySelector('#cdet'), projSel = body.querySelector('#cproj');
+    State.projects.forEach(p => projSel.insertAdjacentHTML('beforeend',
+      `<option value="${esc(p.name)}">${esc(p.name)}</option>`));
+
+    // I5: the workstream half of a `#project/workstream` command-bar scope.
+    // Cases already carry `workstream`, so this is a client-side filter and
+    // needs no backend support. It is deliberately not a dropdown: it exists
+    // only as long as the typed scope does, and any project change clears it.
+    let wsFilter = '';
+
+    const act = async (id, verb, minutes) => {
+      const r = await jpost('/api/cases/act', { id, verb, minutes });
+      if (r && r.ok) { toast('case ' + verb + 'd', 'ok'); load(); }
+    };
+
+    const load = async () => {
+      // project is filtered client-side below (caseProjectMatches) — the
+      // backend does an exact match and would miss worktree-suffixed cases.
+      // Which is exactly why limit is the query's own ceiling (500) and not
+      // the default 100: filtering after the cap would silently drop cases
+      // that fall outside the newest 100 rows, and an under-filled board is
+      // indistinguishable from a quiet one.
+      const qs = ['state=open', 'limit=500'];
+      if (detSel.value) qs.push('detector=' + encodeURIComponent(detSel.value));
+      const r = await apiSafe('/api/cases?' + qs.join('&'), undefined, { silent: true });
+      if (!r) return;
+      let cs = (r.cases || []).filter(c => caseProjectMatches(c, projSel.value));
+      if (wsFilter) cs = cs.filter(c => (c.workstream || 'main') === wsFilter);
+      const scope = (projSel.value ? '#' + projSel.value : '') + (wsFilter ? '/' + wsFilter : '');
+      win.sub.textContent = `— ${cs.length} open${scope ? ' · ' + scope : ''}`;
+      list.innerHTML = '';
+      if (!cs.length) {
+        // A filtered zero-match is NOT an all-clear. Rendering the same
+        // "NOTHING NEEDS YOU" for both is the worst failure this product
+        // has: a false all-clear. Name the filter instead.
+        const bits = [];
+        if (projSel.value || wsFilter) bits.push(scope);
+        if (detSel.value) bits.push(CASE_LABEL[detSel.value] || detSel.value);
+        list.appendChild(el('div', 'empty', bits.length
+          ? `no cases in ${esc(bits.join(' · '))} — this view is filtered`
+          : 'NOTHING NEEDS YOU'));
+        return;
+      }
+      cs.forEach(c => {
+        const card = el('div', 'card');
+        const ev = CASE_EVIDENCE[c.detector];
+        let line = '';
+        try { line = ev ? ev(c.evidence || {}) : JSON.stringify(c.evidence || {}); }
+        catch (e) { line = 'evidence unavailable'; }
+        // D4: same defensive contract as the evidence line — a title is a
+        // nicety, so a missing or renamed key drops it rather than throwing.
+        let tip = '';
+        try { tip = CASE_TITLE[c.detector] ? CASE_TITLE[c.detector](c.evidence || {}) : ''; }
+        catch (e) { tip = ''; }
+        card.innerHTML = `<div class="t">
+            <span class="chip ${CASE_SEV[c.severity] || ''}">${esc(CASE_LABEL[c.detector] || c.detector)}</span>
+            <span class="chip">C-${c.id}</span>
+            <span class="small">${timeAgo(Date.parse(c.opened_ts) / 1000)}</span></div>
+          <div class="d" style="margin-top:4px">${esc(c.project || '?')}:${esc(c.workstream || 'main')}
+            · session ${esc((c.session_id || '').slice(0, 8))}${c.fire_count > 1 ? ' · fired ' + c.fire_count + '×' : ''}</div>
+          <div style="margin-top:6px;user-select:text"${tip ? ` title="${esc(tip)}"` : ''}>${esc(line)}</div>
+          <div class="btnrow" style="margin-top:8px">
+            <button class="btn ghost sm" data-a="term">OPEN TERMINAL</button>
+            <button class="btn ghost sm" data-a="snooze">SNOOZE 1H</button>
+            <button class="btn ghost sm" data-a="dismiss">DISMISS</button>
+            <button class="btn ghost sm" data-a="mute">MUTE DETECTOR</button>
+          </div>`;
+        const cwd = c.evidence && c.evidence.cwd;
+        card.querySelector('[data-a=term]').onclick = () => launchTerm(cwd || '', 'shell');
+        card.querySelector('[data-a=snooze]').onclick = () => act(c.id, 'snooze', 60);
+        card.querySelector('[data-a=dismiss]').onclick = () => act(c.id, 'dismiss');
+        card.querySelector('[data-a=mute]').onclick = () => act(c.id, 'mute', 240);
+        list.appendChild(card);
+      });
+    };
+    // Picking a project from the dropdown clears any typed workstream scope:
+    // the workstream belongs to the project it was typed with, and an
+    // invisible leftover filter is how a filtered board reads as an empty one.
+    detSel.onchange = load;
+    projSel.onchange = () => { wsFilter = ''; load(); };
+    Bus.on('cases:filter', f => {
+      if (f.workstream !== undefined) wsFilter = f.workstream;
+      if (f.detector !== undefined) detSel.value = f.detector;
+      if (f.project !== undefined) {
+        // The command bar (#project) hands us the RAW typed string — it has no
+        // access to case rows and correctly declines to normalise it. If that
+        // string isn't already an option (e.g. a project with no tracked
+        // sessions, or a typo), assigning select.value silently resets to ''
+        // per DOM spec, which would show EVERY project's cases instead of
+        // correctly matching none. Ensure the option exists first so the
+        // assignment sticks; load() then applies the one caseProjectMatches
+        // rule uniformly, whether the value came from a click or a keystroke.
+        if (f.project && !projSel.querySelector(`option[value="${CSS.escape(f.project)}"]`)) {
+          projSel.insertAdjacentHTML('beforeend', `<option value="${esc(f.project)}">${esc(f.project)}</option>`);
+        }
+        projSel.value = f.project;
+      }
+      load();
+    });
+    load();
+    WM.every(win, load, 15000);
+  }
+};
+
 /* ================= app registry (dock order) =================
    terminal, sessions, projects, files, memory, agents, models |
    ops, loops, research, swarm | dashboard, feed  (+ tile button appended by Dock) */
@@ -5618,6 +6179,7 @@ const SettingsApp = {
         ['solarSystem', 'Solar system', 'orbiting planets on a tilted plane, bottom right'],
         ['aurora', 'Aurora', 'flowing borealis ribbons across the top'],
         ['constellations', 'Constellations', 'drifting nodes that wire up when they get close'],
+        ['glyphField', 'Glyph field', 'a constellation held inside letterforms — a live clock, or your own text'],
         ['lavaLamp', 'Lava lamp', 'blobs clump, get buoyant, rise, break apart and sink', 1],
         ['codeRain', 'Code rain', 'falling glyph columns', 1],
         ['circuit', 'Circuit traces', 'a lattice with pulses running along it'],
@@ -5833,6 +6395,16 @@ const SettingsApp = {
         <div class="fxrow"><div class="fxl"><div class="t">Persist window layout</div>
           <div class="d">restore each window's exact position &amp; size on reload (off = re-arrange fresh)</div></div>
           <button class="tgl ${s.persistWindows !== false ? 'on' : ''}" id="sxpersist"></button></div>
+        <div class="fxslider"><label>Fit to content</label>
+          <div class="btnrow seg" style="margin:0;flex-wrap:wrap">
+            <button class="btn ghost sm" data-autofit="off">OFF</button>
+            <button class="btn ghost sm" data-autofit="grow">GROW ONLY</button>
+            <button class="btn ghost sm" data-autofit="both">GROW &amp; SHRINK</button>
+          </div></div>
+        <div class="note"><div class="fxl"><div class="d">
+          Sizes a <b>floating</b> window's height to what is in it, so you are not scrolling a panel that
+          would have fitted. Tiled windows are left to the layout, and resizing a window by hand ends it
+          for that window. Terminals and viewers are skipped — their content has no natural height.</div></div></div>
         <div class="note"><div class="fxl"><div class="d">
           Per-window: the ▦ switch in each title bar includes/excludes it from auto-arrange (excluded windows
           stay open, behind the arranged grid). Double-click a title bar to collapse it. Drag near another
@@ -5888,11 +6460,15 @@ const SettingsApp = {
 
       <div class="settab" data-tab="integrations" style="display:none">
         <div id="intbox"><div class="empty">loading…</div></div>
+        <div class="h2">SESSION SUMMARY</div>
+        <div id="swbox"><div class="empty">loading…</div></div>
       </div>
 
       <div class="settab" data-tab="system" style="display:none">
         <div class="h2" style="margin-top:0">CLAUDE CLI STATUSLINE</div>
         <div id="slbox"><div class="empty">loading…</div></div>
+        <div class="h2">CASES</div>
+        <div id="casebox"><div class="empty">loading…</div></div>
         <div class="h2">SYSTEM &amp; DEPENDENCIES</div>
         <div id="sysbox"><div class="empty">checking…</div></div>
       </div>`);
@@ -5949,7 +6525,15 @@ const SettingsApp = {
       });
       (FX_SPECS[effect] || []).forEach(spec => {
         const cur = fxParamVal(effect, spec);
-        if (spec.type === 'color') {
+        if (spec.type === 'text') {
+          const row = el('div', 'fxslider');
+          row.innerHTML = `<label>${esc(spec.label)}</label>
+            <input type="text" spellcheck="false" maxlength="40" style="flex:1;min-width:0">`;
+          const i = row.querySelector('input');
+          i.value = cur;
+          i.oninput = () => fxParam(effect, spec, i.value);
+          host.appendChild(row); rows.push({ spec, node: row });
+        } else if (spec.type === 'color') {
           const row = el('div', 'fxslider');
           row.innerHTML = `<label>${esc(spec.label)}</label>
             <input type="color" style="width:44px;height:24px;padding:0;border:1px solid var(--line);border-radius:5px;background:none">
@@ -6390,6 +6974,14 @@ const SettingsApp = {
         npFolder.value.trim() || '~/claudeProjects');
     }
     const persistTgl = body.querySelector('#sxpersist');
+    const markFit = () => { const v = Settings.load().autoFit || 'off';
+      body.querySelectorAll('[data-autofit]').forEach(b2 => b2.classList.toggle('acc', b2.dataset.autofit === v)); };
+    body.querySelectorAll('[data-autofit]').forEach(b2 => b2.onclick = () => {
+      Settings.set('autoFit', b2.dataset.autofit); markFit();
+      // apply at once to everything already open, rather than at the next content change
+      WM.wins.forEach(w => { w._userSized = false; WM.fitToContent(w); });
+    });
+    markFit();
     persistTgl.onclick = () => { const on = !Settings.load().persistWindows;
       Settings.set('persistWindows', on); persistTgl.classList.toggle('on', on);
       toast(on ? 'window layout will persist' : 'window layout resets on reload', 'ok'); };
@@ -6697,15 +7289,238 @@ const SettingsApp = {
       };
     };
     renderStatusline();
+    // ---- Session summary (the session-watch daemon) --------------------------
+    // ZENITH owns this daemon's config.json and nothing else about it: there is no
+    // start/stop here because the watcher re-reads the file every pass, so saving IS
+    // applying. The api_key never appears on this wire in either direction — GET
+    // returns has_key, POST sends a provider_id and the server resolves the endpoint
+    // and key from data/providers.json.
+    const renderSessionWatch = async () => {
+      const box = body.querySelector('#swbox');
+      const [cfg, list] = await Promise.all([
+        apiSafe('/api/session-watch/config', undefined, { silent: true }),
+        apiSafe('/api/session-watch', undefined, { silent: true }),
+      ]);
+      if (!cfg) { box.innerHTML = '<div class="empty">session-watch endpoint unavailable</div>'; return; }
+      // "is it running" has no pid to ask — the daemon's only visible heartbeat is how
+      // recently it wrote a summary, so freshness relative to its own interval is the
+      // signal. Two missed passes (min 5 min) is the line between fresh and stale.
+      const ages = ((list && list.sessions) || [])
+        .map(s => s.summary_age_min).filter(a => a != null);
+      const last = ages.length ? Math.min(...ages) : null;
+      const limit = Math.max(5, (cfg.interval || 120) / 60 * 2);
+      const beat = last == null
+        ? '<span class="chip">no summaries written yet</span>'
+        : last <= limit
+          ? `<span class="chip on">watcher running · wrote ${last < 1 ? 'just now'
+            : Math.round(last) + ' min ago'}</span>`
+          : `<span class="chip am">last wrote ${Math.round(last)} min ago — the watcher may be stopped</span>`;
+      const n = (list && list.count) || 0;
+      box.innerHTML = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">${beat}
+          <span class="small" style="margin-left:auto;color:var(--dim)">${n} session${n === 1 ? '' : 's'} tracked</span></div>
+        <div class="note" style="margin:0 0 8px"><div class="d">A local daemon reads every live transcript and writes a short prose summary of what each session is doing — shown by the ◉ button on a terminal window. Pick the model that writes them; None keeps the counted stats and skips the prose.</div></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div class="formrow"><span class="klabel">summaries</span>
+            <select id="swprov" style="width:100%"></select></div>
+          <div class="formrow"><span class="klabel">model</span>
+            <select id="swmodel" style="width:100%"></select></div>
+          <div class="formrow"><span class="klabel">refresh every (s)</span>
+            <input id="swint" type="number" min="15" max="3600" style="width:100%" value="${esc(String(cfg.interval))}"></div>
+          <div class="formrow"><span class="klabel">consider sessions live for (min)</span>
+            <input id="swlive" type="number" min="5" max="1440" style="width:100%" value="${esc(String(cfg.live_window))}"></div>
+        </div>
+        <details style="margin:2px 0 8px"><summary class="small" style="cursor:pointer;color:var(--dim)">Advanced</summary>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px">
+            <div class="formrow"><span class="klabel">num_ctx</span>
+              <input id="swctx" type="number" min="1024" max="131072" style="width:100%" value="${esc(String(cfg.num_ctx))}">
+              <div class="small" style="color:var(--faint);margin-top:3px">Caps the model's KV cache — leaving it uncapped can cost many GB.</div></div>
+            <div class="formrow"><span class="klabel">min_new</span>
+              <input id="swmin" type="number" min="1" max="500" style="width:100%" value="${esc(String(cfg.min_new))}">
+              <div class="small" style="color:var(--faint);margin-top:3px">New transcript events before a session is re-read.</div></div>
+            <div class="formrow"><span class="klabel">brief_every</span>
+              <input id="swbrief" type="number" min="1" max="1000" style="width:100%" value="${esc(String(cfg.brief_every))}">
+              <div class="small" style="color:var(--faint);margin-top:3px">Events between full "this session" rewrites.</div></div>
+          </div></details>
+        <div style="display:flex;align-items:center;gap:9px">
+          <button class="btn primary sm" id="swsave">SAVE</button>
+          <span class="small" id="swmsg" style="color:var(--faint)">Applies within one watcher pass — no restart.</span>
+        </div>`;
+      const provSel = box.querySelector('#swprov'), modelSel = box.querySelector('#swmodel');
+      const msg = box.querySelector('#swmsg');
+      // Same seam the Loops and A/B panels use: /api/providers for the list,
+      // /api/models?provider=… for that provider's models.
+      const loadModels = async keep => {
+        if (!provSel.value) {                       // None → nothing to choose
+          modelSel.innerHTML = '<option value="">—</option>';
+          modelSel.disabled = true; return;
+        }
+        modelSel.disabled = false;
+        modelSel.innerHTML = '<option>loading…</option>';
+        const r = await apiSafe('/api/models?provider=' + encodeURIComponent(provSel.value),
+          undefined, { silent: true });
+        const ms = (r && r.models) || [];
+        // a model already configured but absent from the live list still has to stay
+        // selectable, or saving any other field would silently retarget the watcher
+        if (keep && !ms.includes(keep)) ms.unshift(keep);
+        modelSel.innerHTML = ms.map(m =>
+          `<option value="${esc(m)}"${keep === m ? ' selected' : ''}>${esc(m)}</option>`).join('')
+          || '<option value="">(none)</option>';
+      };
+      const pr = await apiSafe('/api/providers', undefined, { silent: true });
+      const ps = ((pr && pr.providers) || []).filter(p => p.enabled !== false);
+      const on = cfg.enabled && cfg.provider_id;
+      provSel.innerHTML = '<option value="">None — counted stats only</option>'
+        + ps.map(p => `<option value="${esc(p.id)}"${on && cfg.provider_id === p.id
+          ? ' selected' : ''}>${esc(p.name)}</option>`).join('');
+      // a provider that was configured and has since been deleted from providers.json
+      if (cfg.provider_missing && cfg.provider_id) {
+        provSel.insertAdjacentHTML('beforeend',
+          `<option value="${esc(cfg.provider_id)}" selected>${esc(cfg.provider_id)} (missing)</option>`);
+      }
+      provSel.onchange = () => loadModels(null);
+      await loadModels(cfg.model);
+      box.querySelector('#swsave').onclick = async () => {
+        const val = id => box.querySelector(id).value;
+        const payload = {
+          enabled: !!provSel.value,          // None IS the off switch
+          provider_id: provSel.value,
+          model: provSel.value ? modelSel.value : '',
+          num_ctx: val('#swctx'), interval: val('#swint'),
+          live_window: val('#swlive'), min_new: val('#swmin'),
+          brief_every: val('#swbrief'),
+        };
+        msg.style.color = 'var(--faint)'; msg.textContent = 'saving…';
+        // raw api(), not jpost/apiSafe: a 400 here names the offending field and that
+        // message belongs next to the button, not in a toast that slides away.
+        try {
+          const r = await api('/api/session-watch/config', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+          msg.style.color = 'var(--green,#4ef0a6)';
+          msg.textContent = 'saved — ' + (r.enabled
+            ? 'summaries by ' + (r.provider_name || r.provider_id) + ' · ' + r.model
+            : 'summaries off, counted stats only')
+            + '. Applies within one watcher pass.';
+          toast('session summary settings saved', 'ok');
+        } catch (e) {
+          msg.style.color = 'var(--red,#ff5d6c)';
+          msg.textContent = 'not saved — ' + e.message;
+        }
+      };
+    };
+    renderSessionWatch();
+    // ---- Cases (the detector sweep) -----------------------------------------
+    // Same contract as Session summary above: the sweep re-reads this config
+    // every pass, so saving IS applying — there is no start/stop button because
+    // there is nothing to restart. Exposes the master switch, all four
+    // detectors + their thresholds, sweep interval, and the notify block
+    // (quiet hours evaluate in this machine's LOCAL time, not UTC — labeled as
+    // such below since that's the one knob people set to stop a 3am ping).
+    // live_window_minutes, session_gone_hours and dismiss_cooldown_minutes are
+    // deliberately NOT here — tuning constants with reasoned defaults; exposing
+    // them invites breaking the zombie-case protection. File-editable only.
+    const renderCases = async () => {
+      const box = body.querySelector('#casebox');
+      const cfg = await apiSafe('/api/cases/config', undefined, { silent: true });
+      if (!cfg) { box.innerHTML = '<div class="empty">cases endpoint unavailable</div>'; return; }
+      const d = cfg.detectors || {};
+      const nt = cfg.notify || {};
+      const qh = Array.isArray(nt.quiet_hours) && nt.quiet_hours.length === 2
+        ? nt.quiet_hours : ['23:00', '07:00'];
+      const row = (id, label, on, fields) => `
+        <div class="fxrow"><div class="fxl"><div class="t">${esc(label)}</div>
+          <div class="d">${fields}</div></div>
+          <button class="tgl ${on ? 'on' : ''}" data-det="${esc(id)}"></button></div>`;
+      box.innerHTML = `
+        <div class="note" style="margin:0 0 8px"><div class="d">Detectors read counted session
+          facts — tokens, edits, state, transcript size — and never call a model, so they keep
+          working when the GPU is busy. Changes apply within one sweep, no restart.</div></div>
+        <div class="fxrow"><div class="fxl"><div class="t">Cases enabled</div>
+          <div class="d">master switch for every detector</div></div>
+          <button class="tgl ${cfg.enabled ? 'on' : ''}" id="cmaster"></button></div>
+        ${row('waiting_on_you', 'Waiting on you',
+              (d.waiting_on_you || {}).enabled,
+              `fires after <input type="number" min="1" max="600" class="cnum" data-k="waiting_on_you.after_minutes" value="${esc(String((d.waiting_on_you || {}).after_minutes))}" style="width:64px"> min, escalates at <input type="number" min="1" max="1440" class="cnum" data-k="waiting_on_you.escalate_minutes" value="${esc(String((d.waiting_on_you || {}).escalate_minutes))}" style="width:64px"> min`)}
+        ${row('burn_no_progress', 'Burn without progress',
+              (d.burn_no_progress || {}).enabled,
+              `<input type="number" min="1000" max="10000000" step="1000" class="cnum" data-k="burn_no_progress.min_output_tokens" value="${esc(String((d.burn_no_progress || {}).min_output_tokens))}" style="width:96px"> output tokens with zero edits over <input type="number" min="5" max="240" class="cnum" data-k="burn_no_progress.window_minutes" value="${esc(String((d.burn_no_progress || {}).window_minutes))}" style="width:64px"> min`)}
+        ${row('silent_stall', 'Silent stall',
+              (d.silent_stall || {}).enabled,
+              `transcript unchanged for <input type="number" min="1" max="600" class="cnum" data-k="silent_stall.after_minutes" value="${esc(String((d.silent_stall || {}).after_minutes))}" style="width:64px"> min while working`)}
+        ${row('model_fanout', 'Expensive model fan-out',
+              (d.model_fanout || {}).enabled,
+              `models <input type="text" class="ctxt" data-k="model_fanout.watch_models" value="${esc(((d.model_fanout || {}).watch_models || []).join(', '))}" style="width:150px"> across <input type="number" min="1" max="64" class="cnum" data-k="model_fanout.min_subagents" value="${esc(String((d.model_fanout || {}).min_subagents))}" style="width:56px"> subagents`)}
+        <div class="fxslider"><label>sweep every (s)</label>
+          <input type="number" min="15" max="3600" class="cnum" data-k="poll_seconds" value="${esc(String(cfg.poll_seconds))}" style="width:80px"></div>
+        <div class="klabel" style="margin-top:12px">Notifications</div>
+        <div class="fxrow"><div class="fxl"><div class="t">Send notifications</div>
+          <div class="d">push a case to ntfy when it opens or escalates</div></div>
+          <button class="tgl ${nt.enabled ? 'on' : ''}" id="nmaster"></button></div>
+        <div class="fxrow"><div class="fxl"><div class="t">Minimum severity</div>
+          <div class="d">cases below this severity never notify</div></div>
+          <select id="nmin" style="width:110px">
+            <option value="low"${nt.min_severity === 'low' ? ' selected' : ''}>low</option>
+            <option value="medium"${nt.min_severity !== 'low' && nt.min_severity !== 'high' ? ' selected' : ''}>medium</option>
+            <option value="high"${nt.min_severity === 'high' ? ' selected' : ''}>high</option>
+          </select></div>
+        <div class="fxrow"><div class="fxl"><div class="t">Quiet hours (local time)</div>
+          <div class="d">no notifications between these two clock times — evaluated in this
+            machine's local timezone, not UTC</div></div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <input type="time" id="nqstart" value="${esc(qh[0])}" style="width:100px">
+            <span class="small" style="color:var(--faint)">to</span>
+            <input type="time" id="nqend" value="${esc(qh[1])}" style="width:100px">
+          </div></div>
+        <div style="display:flex;align-items:center;gap:9px;margin-top:8px">
+          <button class="btn primary sm" id="csave">SAVE</button>
+          <span class="small" id="cmsg" style="color:var(--faint)">Applies within one sweep.</span>
+        </div>`;
+      const msg = box.querySelector('#cmsg');
+      const master = box.querySelector('#cmaster');
+      const nmaster = box.querySelector('#nmaster');
+      master.onclick = () => master.classList.toggle('on');
+      nmaster.onclick = () => nmaster.classList.toggle('on');
+      box.querySelectorAll('[data-det]').forEach(b => b.onclick = () => b.classList.toggle('on'));
+      box.querySelector('#csave').onclick = async () => {
+        // Only fields this panel actually renders go in `next` — everything
+        // else (live_window_minutes, session_gone_hours, dismiss_cooldown_minutes,
+        // projects, mutes, per-detector severity) is left out entirely and
+        // survives via save_config()'s deep-merge, not sent as a stale copy.
+        const next = { enabled: master.classList.contains('on'), detectors: {} };
+        box.querySelectorAll('[data-det]').forEach(b => {
+          next.detectors[b.dataset.det] = { enabled: b.classList.contains('on') };
+        });
+        box.querySelectorAll('.cnum, .ctxt').forEach(inp => {
+          const [a, b2] = inp.dataset.k.split('.');
+          const v = inp.classList.contains('ctxt')
+            ? inp.value.split(',').map(s => s.trim()).filter(Boolean)
+            : Number(inp.value);
+          if (b2) { next.detectors[a] = Object.assign(next.detectors[a] || {}, { [b2]: v }); }
+          else { next[a] = v; }
+        });
+        next.notify = {
+          enabled: nmaster.classList.contains('on'),
+          min_severity: box.querySelector('#nmin').value,
+          quiet_hours: [box.querySelector('#nqstart').value, box.querySelector('#nqend').value],
+        };
+        msg.style.color = 'var(--faint)'; msg.textContent = 'saving…';
+        try {
+          await api('/api/cases/config', { method: 'POST',
+            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next) });
+          msg.style.color = 'var(--green,#4ef0a6)';
+          msg.textContent = 'saved — applies within one sweep.';
+          toast('cases settings saved', 'ok');
+        } catch (e) {
+          msg.style.color = 'var(--red,#ff5d6c)';
+          msg.textContent = 'not saved — ' + e.message;
+        }
+      };
+    };
+    renderCases();
     // Integrations panel (§6): per-integration mode + connection fields + live status dot,
     // RE-DETECT ALL, and the server-side module-visibility grid (§5.5). Status is read from the
     // Caps singleton (loaded at boot); values from GET /api/config (tokens redacted, env_overrides).
     // DOM built via el()/replaceChildren (codebase convention); every dynamic value passes esc().
     const INTS = [
-      { id: 'nexusmind', name: 'NexusMind memory', fields: [
-        { k: 'sqlite_db', label: 'SQLite path', ph: '~/…/nexusprime.db' },
-        { k: 'pg_dsn', label: 'Postgres DSN', ph: 'postgresql://…' },
-        { k: 'capture_project_dir', label: 'Capture dir', ph: '~/claudeProjects/NexusPrime' }] },
       { id: 'nexusmind_api', name: 'NexusMind API', fields: [
         { k: 'base_url', label: 'Base URL', ph: 'http://127.0.0.1:5055' },
         { k: 'token', label: 'Token', pw: true },
@@ -6720,7 +7535,6 @@ const SettingsApp = {
         hint: 'Nodes are configured in data/gpu_nodes.json or the GPU tab.' },
     ];
     const ENV_VAR = {                                  // <intId>.<fieldKey> -> env var name (for the badge)
-      'nexusmind.sqlite_db': 'ZENITH_NM_DB', 'nexusmind.pg_dsn': 'ZENITH_NM_PG',
       'nexusmind_api.base_url': 'ZENITH_NM_API', 'nexusmind_api.token_file': 'ZENITH_NM_TOKEN_FILE',
       'nexusmind_api.token': 'ZENITH_NM_TOKEN', 'homelab.dir': 'ZENITH_HOMELAB_DIR',
       'homelab.git_user': 'ZENITH_HOMELAB_GIT_USER', 'voice.flowd_url': 'FLOWD_URL',
@@ -7265,8 +8079,13 @@ function moduleApp(spec) {
   };
 }
 
-const DocsModApp = moduleApp({ id: 'library', name: 'Docs', icon: I.files, accent: '#8af0ff', w: 900, h: 640,
-  tabs: [{ key: 'docs', label: 'Docs', app: FilesApp }, { key: 'memory', label: 'Memory', app: MemoryApp }] });
+// Docs. This was a two-tab module (Docs | Memory); Memory left to become the top-level
+// NexusMind app, and a tab bar with one tab in it is just noise, so it collapses back to
+// a plain window that IS FilesApp. The id stays 'library' deliberately: saved layouts, the
+// dock's stored order and MODULE_OF's `files` entry all key on it, and renaming it would
+// silently drop the window from anyone's restored layout for no user-visible gain.
+const DocsModApp = Object.assign({}, FilesApp,
+  { id: 'library', name: 'Docs', icon: I.files, accent: '#8af0ff', w: 900, h: 640 });
 const StudioApp = moduleApp({ id: 'studio', name: 'Models · Agents', icon: I.models, accent: '#b79cff', w: 900, h: 640,
   tabs: [{ key: 'models', label: 'Models', app: ModelsApp }, { key: 'agents', label: 'Agents · Skills', app: AgentsApp }] });
 const RunApp = moduleApp({ id: 'run', name: 'Run', icon: I.ops, accent: '#ffb45e', w: 940, h: 660,
@@ -7277,6 +8096,7 @@ const LabApp = moduleApp({ id: 'lab', name: 'Lab', icon: I.ab, accent: '#ffd479'
   tabs: [{ key: 'ab', label: 'A/B', app: ABApp }, { key: 'gpu', label: 'GPU', app: FleetApp }] });
 const ActivityApp = moduleApp({ id: 'activity', name: 'Activity', icon: I.obs, accent: '#4ef0a6', w: 980, h: 660,
   tabs: [{ key: 'overview', label: 'Overview', app: DashboardApp },
+         { key: 'cases', label: 'Cases', app: CasesApp },
          { key: 'timeline', label: 'Timeline', app: ObsApp }, { key: 'feed', label: 'Feed', app: FeedApp }] });
 // Terminals + Sessions share one icon (id stays 'terminal' so the dock/restore/termOpen wiring is unchanged):
 // the launcher is the default tab (the hot path), Sessions is the read-back of past runs, one click away.
@@ -7296,25 +8116,36 @@ const TerminalApp = moduleApp({ id: 'terminal', name: 'Terminals · Sessions', i
 // data/pa.json with host+rpc, which is server-side endpoint config rather than a Caps integration —
 // unconfigured, POST /api/builder refuses in words, the same honest-refusal path as the terminal's
 // prime-agent mode. A fake integration id here would read as a gate while gating nothing.
+// A key with NO dot gates a whole top-level app (Caps.appVisible); "<modId>.<tabKey>"
+// gates one tab of a module (Caps.tabVisible).
 const REQUIRES = {
-  'library.memory': 'nexusmind',       // Docs module → Memory tab   (MemoryApp)
+  // NexusMind and Watchers share one gate because they share one door: both read the
+  // NexusMind HTTP API (server-side nm_api). ZENITH has no direct-DB path to NM.
+  // NexusMind is gated as a WHOLE app: its terminal and all six of its tabs are the same
+  // integration, so six identical tab entries would say one thing six times — and the
+  // terminal is pinned outside the tab set anyway, where a tab gate could not reach it.
+  memory:           'nexusmind_api',   // NexusMind app (dock button + terminal + tabs)
   'run.watchers':   'nexusmind_api',   // Run module  → Watchers tab (WatchersApp)
   'lab.gpu':        'fleet',           // Lab module  → GPU tab       (FleetApp)
 };
 
 const MODULE_OF = {
-  files: { m: 'library', t: 'docs' }, memory: { m: 'library', t: 'memory' },
+  // 'memory' is NOT here any more: NexusMind is a top-level app id found directly in APPS,
+  // so WM.open('memory') resolves without a hop. 'library' has no tabs left, so `files`
+  // routes to the window with no tab key to switch to (WM.open guards on _showTab).
+  files: { m: 'library' },
   agents: { m: 'studio', t: 'agents' }, models: { m: 'studio', t: 'models' },
   ops: { m: 'run', t: 'jobs' }, loops: { m: 'run', t: 'loops' }, swarm: { m: 'run', t: 'swarm' },
   watchers: { m: 'run', t: 'watchers' }, builder: { m: 'run', t: 'builder' },
   ab: { m: 'lab', t: 'ab' }, fleet: { m: 'lab', t: 'gpu' },
   sessions: { m: 'terminal', t: 'sessions' },
   dashboard: { m: 'activity', t: 'overview' }, obs: { m: 'activity', t: 'timeline' }, feed: { m: 'activity', t: 'feed' },
+  cases: { m: 'activity', t: 'cases' },
 };
 
 const APPS = [
   TerminalApp, ProjectsApp, ResearchApp,
-  Object.assign(DocsModApp, { sep: true }), StudioApp, RunApp, LabApp,
+  Object.assign(DocsModApp, { sep: true }), NexusMindApp, StudioApp, RunApp, LabApp,
   Object.assign(ActivityApp, { sep: true }),
   Object.assign(SettingsApp, { sep: true }),
 ];

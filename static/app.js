@@ -379,6 +379,8 @@ const WM = {
     this.focus(win);
     Dock.update();
     this.persistLayout();
+    // fit to content once the app has laid itself out, then whenever it changes
+    requestAnimationFrame(() => { this.watchFit(win); });
     try { app.render(body, win); }
     catch (e) { body.textContent = 'render error: ' + e.message; }
     // NOT restoring geo.collapsed: the ▾ roll-up button is gone, so a window that came
@@ -442,6 +444,7 @@ const WM = {
   close(win) {
     const wasTiled = win.el.classList.contains('tiled') && this.arranged;
     win.timers.forEach(clearInterval);
+    this.unwatchFit(win);
     if (win.cleanup) { try { win.cleanup(); } catch (e) { /* already gone */ } }
     win.el.classList.add('closing');
     setTimeout(() => win.el.remove(), 170);
@@ -619,7 +622,9 @@ const WM = {
   },
   dragify(win, head) {
     head.addEventListener('pointerdown', e => {
-      if (e.target.closest('button')) return;
+      // any interactive control in the title bar, not just buttons — a press on the
+      // desktop dropdown must open it, not start dragging the window out of its layout
+      if (e.target.closest('button,select,input,textarea')) return;
       const s = win.el.style;
       const ox = e.clientX - parseInt(s.left), oy = e.clientY - parseInt(s.top);
       let moved = false;
@@ -752,10 +757,72 @@ const WM = {
     this.arranged = group.length > 0;
     return this.arranged;
   },
+  /* --- fit a FLOATING window to its content --------------------------------------
+     Only floating windows: a tiled one's size is the layout's business, and resizing it
+     would either be undone on the next arrange or quietly break the row it sits in.
+     Height only. Width is left alone on purpose — text reflows when you change it, so
+     "fit the width" and "fit the height" chase each other and never settle.
+
+     Measured from the body's own overflow (scrollHeight vs clientHeight) rather than
+     from the content's natural height, because that is the number that decides whether
+     you have to scroll, which is the actual complaint. Windows whose body is
+     overflow:hidden manage their own internal layout (terminals, viewers, the modal
+     shells) and are skipped: their content does not HAVE a natural height. */
+  fitToContent(win) {
+    const mode = Settings.load().autoFit || 'off';
+    if (mode === 'off' || !win || !win.el || !win.body) return;
+    if (win.min || win.collapsed || win.colCollapsed || win.max) return;
+    if (win.el.classList.contains('tiled')) return;     // belongs to a layout
+    if (win._userSized) return;                         // they set it by hand; leave it
+    if (win.el.style.display === 'none') return;        // another desktop
+    const b = win.body;
+    if (getComputedStyle(b).overflowY === 'hidden') return;
+    const over = b.scrollHeight - b.clientHeight;
+    if (over > -8 && over < 8) return;                  // deadband: never chase a pixel
+    if (over < 0 && mode !== 'both') return;            // grow-only mode does not shrink
+    const box = this.desktopBox();
+    const H0 = parseInt(win.el.style.height) || win.el.offsetHeight;
+    const T = parseInt(win.el.style.top) || 0;
+    // grow downward, then upward if that runs out of room, and never past the viewport
+    const maxH = Math.max(220, box.h - 8);
+    const H = Math.max(220, Math.min(maxH, H0 + over));
+    if (H === H0) return;
+    win._fitting = true;
+    win.el.style.height = H + 'px';
+    if (T + H > box.h - 4) win.el.style.top = Math.max(0, box.h - H - 4) + 'px';
+    this.saveGeo(win);
+    setTimeout(() => { win._fitting = false; }, 0);
+  },
+  // Re-fit when the content changes. A ResizeObserver on the body would never fire — the
+  // body is flex-sized by the window — so the CHILDREN are observed, and re-observed when
+  // the app swaps them out (tab switches, loaded data).
+  watchFit(win) {
+    if (win._fitRO || !win.body) return;
+    const queue = () => {
+      if (win._fitting || win._fitPend) return;
+      win._fitPend = requestAnimationFrame(() => { win._fitPend = 0; this.fitToContent(win); });
+    };
+    const ro = new ResizeObserver(queue);
+    const reobserve = () => {
+      ro.disconnect();
+      for (const c of win.body.children) ro.observe(c);
+      queue();
+    };
+    const mo = new MutationObserver(reobserve);
+    reobserve();
+    mo.observe(win.body, { childList: true });
+    win._fitRO = ro; win._fitMO = mo;
+  },
+  unwatchFit(win) {
+    if (win._fitRO) { win._fitRO.disconnect(); win._fitRO = null; }
+    if (win._fitMO) { win._fitMO.disconnect(); win._fitMO = null; }
+    if (win._fitPend) { cancelAnimationFrame(win._fitPend); win._fitPend = 0; }
+  },
   resizify(win, handle, dirs) {
     handle.addEventListener('pointerdown', e => {
       e.stopPropagation(); e.preventDefault();
       this.arranged = false;   // manual resize breaks the arranged layout
+      win._userSized = true;   // ...and ends auto-fit for it: you asked for this size
       win.el.classList.remove('tiled');
       const s = win.el.style;
       const x0 = e.clientX, y0 = e.clientY;
@@ -1156,12 +1223,24 @@ const WM = {
     if (c < 2) { ctl.replaceChildren(); ctl.style.display = 'none'; return; }
     ctl.style.display = 'inline-flex';
     ctl.replaceChildren();
-    for (let i = 1; i <= c; i++) {
-      const b = el('button', 'wd' + ((win.desktop || 1) === i ? ' on' : ''), String(i));
-      b.title = 'Move to desktop ' + i;
-      b.onclick = e => { e.stopPropagation(); this.setWinDesktop(win, i); };
-      ctl.appendChild(b);
-    }
+    // One dropdown rather than a chip per desktop: six chips ate ~115px of a title bar
+    // that also has to hold the title, the rename affordance and the window buttons,
+    // where the select is ~34px however many desktops exist.
+    const cur = win.desktop || 1;
+    const trg = el('button', 'wdsel', String(cur));
+    trg.title = 'Move this window to a desktop';
+    // pointerdown, and stopped there: the outside-click watcher also runs on pointerdown,
+    // so letting it through would close the menu and the click would reopen it
+    trg.onpointerdown = e => {
+      e.stopPropagation(); e.preventDefault();
+      if (_menuPop) { closeMenu(); return; }                     // second press closes it
+      const items = [];
+      for (let i = 1; i <= this.desktopCount(); i++) {
+        items.push({ label: 'Desktop ' + i, value: i, on: i === (win.desktop || 1) });
+      }
+      openMenu(trg, items, v => this.setWinDesktop(win, v));
+    };
+    ctl.appendChild(trg);
   },
   // top-bar switcher
   refreshSwitcher() {
@@ -1857,6 +1936,45 @@ function _promptsAway(e) {
    header button. Same interaction contract as the prompts pane (toggle, Esc,
    click-away) and deliberately the same shape of data as the Context tab, just
    condensed to what fits over a terminal. ---- */
+/* --- small anchored dropdown -------------------------------------------------------
+   A native <select> cannot be used where the menu itself has to look like the rest of
+   the app: its popup takes no styling at all, and the platform decides where it opens —
+   macOS lays it OVER the control, centred on the current item, rather than dropping
+   below. So this is hand-built from the same panel/accent tokens as everything else,
+   opens under its trigger, and flips above only when there is no room. */
+let _menuPop = null;
+function closeMenu() {
+  if (!_menuPop) return;
+  _menuPop.remove(); _menuPop = null;
+  document.removeEventListener('keydown', _menuKey, true);
+  document.removeEventListener('pointerdown', _menuAway, true);
+  removeEventListener('resize', closeMenu, true);
+  removeEventListener('scroll', closeMenu, true);
+}
+function _menuKey(e) { if (e.key === 'Escape' && _menuPop) { e.stopPropagation(); closeMenu(); } }
+function _menuAway(e) { if (_menuPop && !_menuPop.contains(e.target)) closeMenu(); }
+// items: [{label, value, on}] — `on` marks the current choice
+function openMenu(anchorEl, items, onPick) {
+  closeMenu();
+  const pop = el('div', 'zmenu');
+  items.forEach(it => {
+    const b = el('button', 'zmenu-item' + (it.on ? ' on' : ''), esc(it.label));
+    b.onclick = ev => { ev.stopPropagation(); closeMenu(); onPick(it.value); };
+    pop.appendChild(b);
+  });
+  document.body.appendChild(pop);
+  _menuPop = pop;
+  const r = anchorEl.getBoundingClientRect();
+  const mh = pop.offsetHeight, mw = pop.offsetWidth;
+  const below = r.bottom + 4;
+  pop.style.top = (below + mh <= innerHeight - 8 ? below : Math.max(8, r.top - mh - 4)) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, innerWidth - mw - 8)) + 'px';
+  document.addEventListener('keydown', _menuKey, true);
+  document.addEventListener('pointerdown', _menuAway, true);
+  addEventListener('resize', closeMenu, true);
+  addEventListener('scroll', closeMenu, true);
+}
+
 let _ctxPop = null;
 function closeCtxPanel() {
   if (!_ctxPop) return;
@@ -1875,7 +1993,7 @@ const _ctxTone = p => p >= 90 ? '#ff5d6c' : p >= 70 ? '#ffb45e' : '#4ef0a6';
 async function openContextPanel(termId, anchorEl, label) {
   const tag = 'term:' + termId;
   if (_ctxPop && _ctxPop.dataset.src === tag) return closeCtxPanel();   // toggle
-  closeCtxPanel(); closePromptsPanel();
+  closeCtxPanel(); closePromptsPanel(); closeSummaryPanel();
   const pop = el('div', 'ctx-pop');
   pop.dataset.src = tag;
   pop.style.cssText = 'position:fixed;z-index:9000;width:430px;max-width:calc(100vw - 24px);'
@@ -1953,10 +2071,306 @@ async function openContextPanel(termId, anchorEl, label) {
   document.addEventListener('pointerdown', _ctxAway, true);
 }
 
+/* ---- session summary popover: the watcher's prose read of this session — what it
+   has been doing, and what it is doing right now. Same interaction contract as the
+   context and prompts panes (toggle, Esc, click-away), but this one polls while it
+   is open: `now_line` is the only thing in the app that goes stale on its own. The
+   interval is cleared on close, so a closed panel never touches the network. ---- */
+let _summaryPop = null, _summaryTimer = null;
+function closeSummaryPanel() {
+  if (!_summaryPop) return;
+  _summaryPop.remove(); _summaryPop = null;
+  clearInterval(_summaryTimer); _summaryTimer = null;
+  document.removeEventListener('keydown', _summaryKey, true);
+  document.removeEventListener('pointerdown', _summaryAway, true);
+}
+function _summaryKey(e) {
+  if (e.key === 'Escape' && _summaryPop) { e.stopPropagation(); closeSummaryPanel(); }
+}
+function _summaryAway(e) {
+  if (_summaryPop && !_summaryPop.contains(e.target)) closeSummaryPanel();
+}
+// working = the watcher saw tool activity since the last user turn; waiting = the
+// turn is finished and it is the human's move; idle = neither, for a while.
+const _swStateTone = s => s === 'working' ? '#4ef0a6' : s === 'waiting' ? '#ffb45e'
+  : 'var(--faint,#5c7a8a)';
+
+// src: {term:'<id>'} for a live terminal, {session:'<id>'} for any known session,
+// or {path:'<transcript>'} — the same three addresses /api/session-watch/session takes.
+async function openSummaryPanel(src, anchor, label) {
+  const tag = JSON.stringify(src);
+  if (_summaryPop && _summaryPop.dataset.src === tag) return closeSummaryPanel();  // toggle
+  closeSummaryPanel(); closeCtxPanel(); closePromptsPanel();
+  const pop = el('div', 'summary-pop');
+  pop.dataset.src = tag;
+  // Wider and taller than the context/prompts panes on purpose: this one carries prose
+  // plus a trail plus stats, and at 430px every trail line wrapped to three.
+  const W = 560;
+  pop.style.cssText = `position:fixed;z-index:9000;width:${W}px;max-width:calc(100vw - 24px);`
+    + 'max-height:min(84vh,760px);display:flex;flex-direction:column;overflow:hidden;'
+    + 'background:var(--panel,#0a1118);border:1px solid var(--acc,#3fe3ff);border-radius:10px;'
+    + 'box-shadow:0 20px 60px rgba(0,0,0,.6);font-size:12px';
+  // The age sits immediately left of the button that acts on it, so "how old is this"
+  // and "get me a newer one" read as one control rather than two unrelated bits of chrome.
+  const head = el('div', '', `<span style="font-family:var(--disp,inherit);letter-spacing:.08em;
+      color:var(--acc,#3fe3ff)">SESSION SUMMARY</span>
+    <span class="sstate" style="margin-left:6px"></span>
+    <span style="flex:1"></span>
+    <span class="sage" style="color:var(--faint,#5c7a8a);font-size:10.5px;white-space:nowrap"></span>
+    <button class="btn ghost sm" data-a="refresh" style="white-space:nowrap"
+      title="Re-read the watcher's latest summary">⟳ UPDATE</button>
+    <button class="btn ghost sm" data-a="close" title="Close (Esc)">✕</button>`);
+  head.style.cssText = 'display:flex;align-items:center;gap:4px;padding:8px 10px;flex:none;'
+    + 'border-bottom:1px solid rgba(127,127,127,.22)';
+  if (label) {
+    const sub = el('div', 'd', esc(label));
+    sub.style.cssText = 'padding:0 10px 7px;flex:none;color:var(--faint,#5c7a8a);'
+      + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    head.after(sub);
+  }
+  const body = el('div');
+  body.style.cssText = 'overflow-y:auto;padding:10px;flex:1 1 auto';
+  body.innerHTML = '<div class="empty">reading the watcher…</div>';
+  pop.append(head, body);
+  document.body.appendChild(pop);
+  _summaryPop = pop;
+  const r = anchor && anchor.getBoundingClientRect();
+  pop.style.left = Math.max(12, Math.min(r ? r.left - 60 : (innerWidth - W) / 2,
+                                         innerWidth - (W + 12))) + 'px';
+  pop.style.top = Math.max(12, Math.min(r ? r.bottom + 6 : 90, innerHeight - 200)) + 'px';
+  head.querySelector('[data-a=close]').onclick = closeSummaryPanel;
+
+  const qs = src.term ? 'term=' + encodeURIComponent(src.term)
+    : src.session ? 'session=' + encodeURIComponent(src.session)
+      : 'path=' + encodeURIComponent(src.path || '');
+  const sec = (h, txt) => `<div style="margin-bottom:11px">
+      <div style="font:600 10px var(--disp,inherit);letter-spacing:.14em;text-transform:uppercase;
+        color:var(--faint,#5c7a8a);margin-bottom:3px">${h}</div>
+      <div style="color:var(--text);line-height:1.5;white-space:pre-wrap;word-break:break-word;
+        user-select:text">${esc(txt)}</div></div>`;
+  const stat = (n, l) => `<div><div style="font:700 17px var(--mono);
+      font-variant-numeric:tabular-nums;color:var(--text);line-height:1.1">${n || 0}</div>
+    <div style="font-size:10px;color:var(--faint,#5c7a8a);margin-top:2px">${l}</div></div>`;
+  /* The trail — what has been GOING ON, newest first. The server hands back only the
+     narrative events (a prompt, an answer, a conclusion) and drops the tool mechanics,
+     because "BASH sed -n …" says what was typed rather than what is happening; the
+     aggregate mechanics still live in the Work section below. Prose is proportional,
+     not mono: these are sentences, not commands. Each row is a button that jumps to
+     that moment in the transcript. Clamped to three lines so one long answer cannot
+     push the rest of the panel out of view. */
+  const EV_LABEL = { USER: 'YOU', SAY: 'CLAUDE' };
+  const EV_TONE = { USER: 'var(--acc,#3fe3ff)', SAY: 'var(--cyan-soft,#8ceeff)' };
+  // Which rows the reader has expanded, by seq. Kept OUTSIDE the render because the
+  // 15s poll rebuilds body.innerHTML wholesale — without this, opening a line to read
+  // it would silently re-collapse under you within a quarter of a minute.
+  const openSeqs = new Set();
+  const recentHTML = s => {
+    const evs = (Array.isArray(s.recent) ? s.recent : []).filter(e => e && e.text);
+    if (!evs.length) return '';
+    const row = e => `<button class="swev${openSeqs.has(e.seq) ? ' open' : ''}"
+        data-seq="${esc(String(e.seq))}" title="Click to show the whole line">
+      <span style="font:10px var(--mono);color:var(--faint,#5c7a8a)">${esc(e.at || '')}</span>
+      <span style="font:600 9.5px var(--disp,inherit);letter-spacing:.09em;
+        color:${EV_TONE[e.kind] || 'var(--dim)'}">${esc(EV_LABEL[e.kind] || e.kind)}</span>
+      <span class="t">${esc(e.text)}</span></button>`;
+    return `<div style="margin-bottom:11px">
+        <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:2px">
+          <span style="font:600 10px var(--disp,inherit);letter-spacing:.14em;
+            text-transform:uppercase;color:var(--faint,#5c7a8a)">Recently — newest first</span>
+          <span style="flex:1"></span>
+          <button class="btn ghost sm" data-a="opensess"
+            title="Open this session in the Sessions app">SESSION ⧉</button>
+        </div>
+        ${evs.map(row).join('')}</div>`;
+  };
+  // The counted stats say how MUCH happened; this says WHAT. Both come free with the
+  // row the watcher already writes, so it costs nothing beyond rendering it.
+  const FILES_SHOWN = 14;
+  const workHTML = s => {
+    const files = Array.isArray(s.files) ? s.files : [];
+    const tools = (Array.isArray(s.tools) ? s.tools : [])
+      .filter(t => Array.isArray(t) && t[0]);
+    if (!files.length && !tools.length) return '';
+    // basename carries the meaning at this width; the directory is the tooltip.
+    // Paths are shown newest-last exactly as the watcher recorded them.
+    const fileRow = p => {
+      const parts = String(p).split('/');
+      const base = parts.pop() || p;
+      return `<div title="${esc(p)}" style="display:flex;gap:6px;align-items:baseline;
+          padding:1px 0;overflow:hidden">
+        <span style="font:11px var(--mono);color:var(--cyan-soft,#8ceeff);
+          white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(base)}</span>
+        <span style="font-size:10px;color:var(--faint,#5c7a8a);white-space:nowrap;
+          overflow:hidden;text-overflow:ellipsis;direction:rtl;min-width:0;flex:1"
+          >${esc(parts.join('/'))}</span></div>`;
+    };
+    const extra = files.length - FILES_SHOWN;
+    return `<div style="margin-top:11px;border-top:1px solid rgba(127,127,127,.18);padding-top:9px">
+        <div style="font:600 10px var(--disp,inherit);letter-spacing:.14em;text-transform:uppercase;
+          color:var(--faint,#5c7a8a);margin-bottom:4px">Work</div>
+        ${files.length ? files.slice(0, FILES_SHOWN).map(fileRow).join('')
+          + (extra > 0 ? `<div style="font-size:10px;color:var(--faint,#5c7a8a);
+              margin-top:2px">+${extra} more file${extra === 1 ? '' : 's'}</div>` : '')
+          : ''}
+        ${tools.length ? `<div style="margin-top:7px;display:flex;flex-wrap:wrap;gap:4px">${
+          tools.map(([name, n]) => `<span class="chip" style="font-size:10px">${esc(name)}${
+            n > 1 ? ` <b style="color:var(--acc,#3fe3ff)">${n}</b>` : ''}</span>`).join('')
+        }</div>` : ''}
+      </div>`;
+  };
+
+  // Last summary_at this panel has seen. The UPDATE button diffs against it to tell
+  // "the watcher wrote a new one" apart from "re-read, nothing new yet" — the whole
+  // difference between useful feedback and a button that looks broken.
+  let lastSummaryAt = null;
+  let lastRow = null;                     // for the SESSION ⧉ hand-off
+  /* Delegated once, not per render: the poll replaces body.innerHTML every 15s, so
+     handlers bound to individual rows would be thrown away with them.
+       - a trail row toggles its own clamp, so a clipped line can be read in full
+       - SESSION ⧉ hands off to the Sessions app using that app's own Bus contract
+         (WM.open then a deferred 'sessions:detail'), the same two-step its other
+         call sites use — spawn() registers the listener synchronously but the
+         codebase defers the emit, so we match it rather than race it. */
+  body.addEventListener('click', ev => {
+    const openBtn = ev.target.closest('[data-a=opensess]');
+    if (openBtn) {
+      ev.stopPropagation();
+      const s = lastRow;
+      if (!s || !(s.session_id || s.path)) return toast('no transcript for this session', 'err');
+      WM.open('sessions');
+      setTimeout(() => Bus.emit('sessions:detail',
+        { sid: s.session_id, path: s.path }), 80);
+      closeSummaryPanel();
+      return;
+    }
+    const rowEl = ev.target.closest('.swev');
+    if (!rowEl) return;
+    ev.stopPropagation();
+    const seq = Number(rowEl.dataset.seq);
+    if (openSeqs.has(seq)) openSeqs.delete(seq); else openSeqs.add(seq);
+    rowEl.classList.toggle('open', openSeqs.has(seq));
+  });
+  const load = async () => {
+    const s = await apiSafe('/api/session-watch/session?' + qs, undefined, { silent: true });
+    if (!_summaryPop) return;                       // closed while fetching
+    const chip = head.querySelector('.sstate');
+    // Set on every path, including the two early returns: an age left over from the
+    // previous poll next to a "no record" body would misreport what you are looking at.
+    const setAge = a => { head.querySelector('.sage').textContent = a == null
+      ? 'never updated'
+      : 'updated ' + (a < 1 ? 'just now' : Math.round(a) + ' min ago'); };
+    if (!s || !s.available) {
+      chip.innerHTML = '';
+      head.querySelector('.sage').textContent = '';
+      body.innerHTML = `<div class="empty">${esc((s && s.detail)
+        || 'the watcher has no record of this session yet')}</div>`;
+      return s;
+    }
+    setAge(s.summary_age_min);
+    lastSummaryAt = s.summary_at || null;
+    lastRow = s;
+    const st = String(s.state || '').trim();
+    // the pulsing dot is reserved for `working` — a steady chip everywhere else, so
+    // motion in the corner of the eye always means the same thing
+    chip.innerHTML = st ? `<span class="chip" style="color:${_swStateTone(st)};
+      border-color:${_swStateTone(st)}">${st === 'working'
+        ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;
+            background:currentColor;margin-right:5px;animation:pulse 1.4s infinite"></span>` : ''
+      }${esc(st)}</span>` : '';
+    if (!s.now_line && !s.brief) {
+      body.innerHTML = '<div class="empty">no summary yet — the watcher may not be running</div>';
+      return s;
+    }
+    const models = String(s.models || '').split(',').map(m => m.trim())
+      .filter(m => m && m !== '<synthetic>').map(fmtModel);
+    /* A window can be bound to a session that has STOPPED producing events —
+       most often a --resume that has since forked to a new session id, so the
+       live typing goes to a different transcript while this one is frozen. The
+       summary is then correct and ancient at the same time, which reads as a
+       broken watcher. Name the binding and the silence so it reads as what it
+       is. 30 min is well past a normal think-pause. */
+    const idle = s.age_min != null && s.age_min > 30;
+    const dur = m => m < 90 ? Math.round(m) + ' min' : (m / 60).toFixed(1) + ' h';
+    body.innerHTML = (idle ? `<div style="margin-bottom:10px;padding:6px 8px;
+        border:1px solid color-mix(in srgb,#ffb45e 45%,transparent);border-radius:6px;
+        background:color-mix(in srgb,#ffb45e 10%,transparent);color:var(--text);
+        font-size:11px;line-height:1.45">bound to session
+        <b style="font-family:var(--mono)">${esc(String(s.session_id || '?').slice(0, 8))}</b>,
+        which has written nothing for ${esc(dur(s.age_min))}. If this window is busy
+        right now it has resumed into a different session — the summary below is of
+        the old one.</div>` : '')
+      + (s.now_line ? sec('Right now', s.now_line) : '')
+      + (s.brief ? sec('This session', s.brief) : '')
+      + recentHTML(s)
+      + `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;
+          border-top:1px solid rgba(127,127,127,.18);padding-top:10px">
+          ${stat(s.files_edited, 'files edited')}${stat(s.subagents, 'subagents')}
+          ${stat(s.errors, 'errors')}${stat(s.prompts, 'prompts')}</div>`
+      + workHTML(s)
+      + (models.length ? `<div style="margin-top:10px;color:var(--faint,#5c7a8a);
+          font-size:10.5px">${esc(models.join(', '))}</div>` : '');
+    return s;
+  };
+  /* Re-read on demand, and SAY WHAT HAPPENED. Two things made the first version look
+     dead: the read is a local sqlite query that returns in single-digit ms, so the
+     pending state was never on screen long enough to see; and the watcher usually has
+     not written a new row since the last poll, so a successful update legitimately
+     changes nothing visible. Reporting "no change yet" is the answer — silence is
+     indistinguishable from a broken button. The body is left in place rather than
+     blanked, because flashing "reading…" over good content to announce that nothing
+     moved reads as a fault too. */
+  const btnUp = head.querySelector('[data-a=refresh]');
+  let upBusy = false;
+  btnUp.onclick = async () => {
+    if (upBusy) return;
+    upBusy = true;
+    btnUp.disabled = true;
+    btnUp.textContent = '⟳ …';
+    const before = lastSummaryAt;
+    // Floor the pending state at 320ms so the press always registers visually.
+    const [row] = await Promise.all([load(),
+      new Promise(res => setTimeout(res, 320))]);
+    if (!btnUp.isConnected) return;                 // panel closed mid-update
+    // Three outcomes, not two. "NO CHANGE" was true but useless: it could mean the
+    // watcher simply has not run yet, or that there is nothing left to summarise
+    // because the transcript has not grown. Only the first is worth waiting on, and
+    // conflating them is what makes a finished session look like a broken button.
+    const moved = row && row.available && row.summary_at && row.summary_at !== before;
+    const current = row && row.available && row.events_seen != null
+      && row.events_seen === row.summary_events;
+    btnUp.textContent = moved ? '✓ NEW' : current ? '✓ UP TO DATE' : '· NOT YET';
+    btnUp.title = moved ? 'the watcher wrote a new summary'
+      : current ? 'this summary already covers every event in the transcript — '
+        + 'nothing new has been written to summarise'
+        : 'the watcher has not written a new summary yet; it runs once per pass';
+    btnUp.style.color = moved ? 'var(--green,#4ef0a6)' : 'var(--faint,#5c7a8a)';
+    const sage = head.querySelector('.sage');
+    if (moved && sage) {                            // flash the age it just refreshed
+      sage.style.transition = 'none';
+      sage.style.color = 'var(--green,#4ef0a6)';
+      setTimeout(() => { sage.style.transition = 'color .8s'; sage.style.color = ''; }, 80);
+    }
+    setTimeout(() => {
+      if (!btnUp.isConnected) return;
+      btnUp.textContent = '⟳ UPDATE';
+      btnUp.style.color = '';
+      btnUp.disabled = false;
+      upBusy = false;
+    }, 1600);
+  };
+  load();
+  // The watcher writes a row roughly once a pass; 15s keeps `working`/`now_line` and
+  // the age readout honest without being a poll of consequence — it is one indexed
+  // sqlite read against a local file. Cleared in closeSummaryPanel().
+  _summaryTimer = setInterval(load, 15000);
+  document.addEventListener('keydown', _summaryKey, true);
+  document.addEventListener('pointerdown', _summaryAway, true);
+}
+
 async function openPromptsPanel(src, anchor, label) {
   const tag = JSON.stringify(src);
   if (_promptsPop && _promptsPop.dataset.src === tag) return closePromptsPanel();  // toggle
-  closePromptsPanel();
+  closePromptsPanel(); closeSummaryPanel();
   const pop = el('div', 'prompts-pop');
   pop.dataset.src = tag;
   pop.style.cssText = 'position:fixed;z-index:9000;width:460px;max-width:calc(100vw - 24px);'
@@ -2125,6 +2539,21 @@ function openTermWindow(t, opts) {
         };
         tickCtx();
         win.timers.push(setInterval(tickCtx, 45000));
+
+        // Three tapering lines — a paragraph — with the last trailing off into a dot:
+        // prose about this session, still being written. Reads at 14px where anything
+        // busier turns to mush, and stays distinct from ❝ and the ◔ gauge.
+        const bs = el('button', 'wsummary',
+          '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" '
+          + 'stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+          + '<path d="M4 6.5h16"/><path d="M4 12h11"/><path d="M4 17.5h5.5"/>'
+          + '<circle cx="13.2" cy="17.5" r="1.5" fill="currentColor" stroke="none"/>'
+          + '</svg>');
+        attachTip(bs, 'Session summary — what this session has been doing');
+        bs.onclick = e => { e.stopPropagation(); openSummaryPanel({ term: t.id }, bs, t.cwd || t.label); };
+        // Header proper, right after the app icon and before the title.
+        const wtitle = win.head.querySelector('.wtitle');
+        if (wtitle) wtitle.before(bs); else win.head.appendChild(bs);
       }
 
       // --- select & copy ---------------------------------------------------
@@ -2632,13 +3061,47 @@ async function resumeSession(sess) {
   return r;
 }
 
+/* ---- quick-capture to NexusMind, with a queue so text is never lost ---- */
+const CAPTURE_PREFIXES = ['idea', 'todo', 'bug', 'decision', 'note', 'q', 'req'];
+const CAPTURE_RE = new RegExp('^(' + CAPTURE_PREFIXES.join('|') + '):\\s*(.+)$', 'i');
+
+function captureQueue() {
+  try { return JSON.parse(localStorage.getItem('zen.capture.queue')) || []; }
+  catch (e) { return []; }
+}
+function captureEnqueue(text) {
+  try {
+    const q = captureQueue(); q.push({ text, at: Date.now() });
+    localStorage.setItem('zen.capture.queue', JSON.stringify(q.slice(-200)));
+  } catch (e) { /* quota */ }
+}
+// A capture surface that silently drops input is worse than none, so a failed
+// POST parks the line locally and says so, and every later success drains it.
+async function captureSend(text) {
+  const r = await apiSafe('/api/capture', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }) }, { silent: true });
+  if (r && r.ok) {
+    toast('stored' + (r.key ? ' ' + r.key : ''), 'ok');
+    const q = captureQueue();
+    if (q.length) {
+      try { localStorage.removeItem('zen.capture.queue'); } catch (e) { /* quota/private mode */ }
+      for (const it of q) captureSend(it.text);
+    }
+    return true;
+  }
+  captureEnqueue(text);
+  toast('capture queued — NexusMind unreachable (' + ((r && r.detail) || 'offline') + ')', 'err');
+  return false;
+}
+
 /* ================= command palette ================= */
 const Palette = {
   sel: 0, items: [],
   open() {
     $('#pal').classList.add('show');
     const inp = $('#palinput');
-    inp.value = ''; inp.focus();
+    inp.value = ''; this._raw = ''; inp.focus();
     this.query('');
   },
   close() { $('#pal').classList.remove('show'); },
@@ -2712,8 +3175,90 @@ const Palette = {
         run: () => openChatWindow({ id: ch.id, providerId: ch.provider, providerName: ch.providerName,
           model: ch.model, messages: ch.messages, title: ch.title }) });
     });
+    // ---- command-bar grammar: capture / case verbs / scoping -------------
+    // One line, one language. Anything unmatched falls through to the app
+    // launcher below, so nothing that worked before stops working.
+    const raw = (this._raw || q).trim();
+
+    const cap = raw.match(CAPTURE_RE);
+    if (cap) {
+      const kind = cap[1].toLowerCase();
+      items.push({ icon: I.mem, label: 'Capture ' + kind + ': ' + cap[2].slice(0, 54),
+        sub: 'NexusMind', kind: 'capture', score: 99,
+        run: () => captureSend(raw) });
+    }
+
+    // 'kill' is deliberately absent: it routes through the existing job.stop
+    // rule, not case-id dispatch — /api/cases/act only implements snooze/
+    // dismiss/mute and 400s on anything else. Do not re-add it from the spec.
+    // I5: the numeric argument takes an optional unit suffix. The spec's own
+    // grammar row `c118 snooze 1h` did not match the shipped regex at all —
+    // it fell through to the app launcher, silently doing something else.
+    // Bare integers still mean minutes, so nothing that worked before changes.
+    const cref = raw.match(/^c-?(\d+)\s*(open|snooze|dismiss|mute)?\s*(\d+)?\s*(m|min|mins|h|hr|hrs|d)?$/i);
+    if (cref) {
+      const id = +cref[1], verb = (cref[2] || '').toLowerCase();
+      const unit = (cref[4] || 'm').toLowerCase()[0];
+      const n = cref[3] ? +cref[3] * (unit === 'h' ? 60 : unit === 'd' ? 1440 : 1) : 60;
+      if (!verb) {
+        items.push({ icon: I.obs, label: 'Open case C-' + id, kind: 'case', score: 98,
+          run: () => WM.open('cases') });
+      } else if (verb === 'open') {
+        // I3/I5: resolve the case's OWN directory. This used to open
+        // localStorage['zen.lastcwd'] — whatever terminal was opened last,
+        // which has nothing to do with case <id> — while claiming to open
+        // the case. Every detector now puts the session's cwd on the case
+        // evidence, so one fetch answers it honestly.
+        items.push({ icon: I.term, label: 'C-' + id + ': open its session directory', kind: 'case', score: 98,
+          run: async () => {
+            // N2: `state=all`, not `state=`. A blank value is dropped by the
+            // server's parse_qs (keep_blank_values defaults to False), so the
+            // old query silently resolved to state=open, and every snoozed,
+            // dismissed or resolved id fell through to the "no directory
+            // recorded" toast — untrue, those cases carry a cwd like any
+            // other. `all` is a sentinel /api/cases understands explicitly.
+            const r = await apiSafe('/api/cases?state=all&limit=500', undefined, { silent: true });
+            const c = (r?.cases || []).find(x => x.id === id);
+            const cwd = c && c.evidence && c.evidence.cwd;
+            if (!cwd) { toast('C-' + id + ': no directory recorded on that case', 'err'); return; }
+            launchTerm(cwd, 'shell');
+          } });
+      } else {
+        items.push({ icon: I.obs, label: 'C-' + id + ': ' + verb + (verb === 'snooze' || verb === 'mute' ? ' ' + n + 'm' : ''),
+          kind: 'case', score: 98,
+          run: async () => { const r = await jpost('/api/cases/act', { id, verb, minutes: n });
+            if (r && r.ok) toast('case ' + verb + 'd', 'ok'); } });
+      }
+    }
+
+    const DET_WORDS = { waiting: 'waiting_on_you', burn: 'burn_no_progress',
+                        stall: 'silent_stall', fanout: 'model_fanout' };
+    if (DET_WORDS[raw.toLowerCase()]) {
+      const d = DET_WORDS[raw.toLowerCase()];
+      items.push({ icon: I.obs, label: 'Cases: ' + raw.toLowerCase(), sub: d, kind: 'scope', score: 97,
+        run: () => { WM.open('cases'); setTimeout(() => Bus.emit('cases:filter', { detector: d }), 80); } });
+    }
+
+    // I5: `#project/workstream` captured the workstream and then threw it
+    // away, scoping to the whole project while the label claimed otherwise.
+    // The workstream half is honoured client-side by the Cases tab (cases
+    // carry `workstream`, so this needs no backend support) and shown in
+    // the window subtitle so a filtered board can never read as an empty one.
+    const scope = raw.match(/^#([\w.-]+)(?:\/([\w.\/-]+))?$/);
+    if (scope) {
+      const proj = scope[1], ws = scope[2] || '';
+      items.push({ icon: I.obs, label: 'Cases in #' + proj + (ws ? '/' + ws : ''), kind: 'scope', score: 96,
+        run: () => { WM.open('cases'); setTimeout(() => Bus.emit('cases:filter',
+          { project: proj, workstream: ws, detector: '' }), 80); } });
+      items.push({ icon: I.term, label: 'Terminal in #' + proj, kind: 'scope', score: 95,
+        run: () => { const p = State.projects.find(x => x.name.toLowerCase().startsWith(proj.toLowerCase()));
+          launchTerm(p ? p.path : '', 'shell'); } });
+    }
+
     this.items = items.filter(i => i.score > 0).sort((a, b) => b.score - a.score).slice(0, 16);
-    if (q.length > 2 && Caps.tabVisible('library', 'memory')) {   // Phase-3: no Memory results when its tab is hidden
+    // Phase-3: no Memory results when NexusMind is hidden. It is its own top-level app now,
+    // so this asks appVisible() about that app instead of the retired 'library.memory' tab.
+    if (q.length > 2 && Caps.appVisible(APPS.find(a => a.id === 'memory'))) {
       const r = await apiSafe('/api/memory?q=' + encodeURIComponent(q) + '&limit=5', undefined, { silent: true });
       (r?.memories || []).forEach(m => this.items.push({ icon: I.mem, label: m.title || m.key,
         sub: 'memory · ' + m.namespace, kind: 'memory', score: 1,
@@ -2739,7 +3284,10 @@ const Palette = {
     if (it) { this.close(); it.run(); }
   }
 };
-$('#palinput').addEventListener('input', e => Palette.query(e.target.value.toLowerCase()));
+$('#palinput').addEventListener('input', e => {
+  Palette._raw = e.target.value;              // grammar needs original case
+  Palette.query(e.target.value.toLowerCase());
+});
 $('#palinput').addEventListener('keydown', e => {
   if (e.key === 'ArrowDown') { Palette.sel = Math.min(Palette.items.length - 1, Palette.sel + 1); Palette.render(); e.preventDefault(); }
   if (e.key === 'ArrowUp') { Palette.sel = Math.max(0, Palette.sel - 1); Palette.render(); e.preventDefault(); }
@@ -2944,7 +3492,7 @@ const FX_DEFAULTS = {
   // must render exactly what it rendered before, and each is individually switchable.
   deepNebula: false, solarSystem: false, aurora: false, constellations: false,
   lavaLamp: false,
-  codeRain: false, circuit: false, radar: false,
+  codeRain: false, circuit: false, radar: false, glyphField: false,
   fxIntensity: 1,      // master opacity for the ambient layers, 0.3–1.6
   // --- whimsy: something crosses the screen every now and then ---
   flybys: false, flybysBack: true,   // 'flybysBack' is the back-canvas half of the same
@@ -2962,6 +3510,7 @@ const FX_DEFAULTS = {
   arrangeInclude: { columns: false, tiled: false, cascade: true },
   dragMode: 'reflow',     // in-arrangement drag: 'reflow' (push & fill) or 'free' (snap to rejoin)
   persistWindows: true,   // restore each window's exact position/size on reload
+  autoFit: 'grow',        // size FLOATING windows to their content: off | grow | both
   sttMode: 'auto',        // mic speech-to-text source: auto | browser | whisper
   desktopCount: 1,        // virtual desktops (workspaces), 1–6
   deskScheme: 'ctrl',     // desktop digit/send shortcut modifier: 'ctrl' or 'ctrl+alt'
@@ -2985,7 +3534,7 @@ const FX_DEFAULTS = {
 };
 // interface settings a visual preset must NOT clobber (presets only touch look/FX)
 const KEEP_ON_PRESET = ['arrangeMode', 'arrangeInclude', 'dragMode', 'dockPos', 'persistWindows', 'sttMode',
-  'desktopCount', 'deskScheme', 'deskArrowMod', 'defaultWinSize', 'uiFont', 'density',
+  'desktopCount', 'deskScheme', 'deskArrowMod', 'defaultWinSize', 'uiFont', 'density', 'autoFit',
   'accentHue', 'motionLevel', 'cornerRadius', 'panelAlpha', 'panelBlur',
   'clock24', 'clockSec', 'uiSounds', 'defaultAgent', 'defaultProjectsFolder',
   // user content + tuning no preset knows about: dropping fxMedia/flybyCustom would
@@ -3181,12 +3730,44 @@ const X1 = v => v.toFixed(1) + '×', X2 = v => v.toFixed(2) + '×', PCT = v => M
 const PX = v => v + 'px', SEC = v => v + 's';
 const FX_SPECS = {
   deepNebula: [
-    { k: 'clouds', label: 'Clouds', min: 2, max: 12, step: 1, def: 5, fmt: v => v },
-    { k: 'size', label: 'Size', min: 0.4, max: 2.2, step: 0.05, def: 1, fmt: X2 },
+    { k: 'scale', label: 'Structure size', min: 0.3, max: 3, step: 0.05, def: 1, fmt: X2 },
+    { k: 'detail', label: 'Detail', min: 1, max: 5, step: 1, def: 3, fmt: v => v + ' oct' },
+    { k: 'contrast', label: 'Wispiness', min: 0.5, max: 4, step: 0.1, def: 1.6, fmt: X1 },
+    { k: 'coverage', label: 'Density', min: 0.15, max: 1, step: 0.05, def: 0.62, fmt: PCT },
+    { k: 'spread', label: 'Extent', min: 0.2, max: 1, step: 0.05, def: 0.6, fmt: PCT },
+    { k: 'dust', label: 'Dust lanes', min: 0, max: 1, step: 0.05, def: 0.35, fmt: PCT },
+    { k: 'gain', label: 'Brightness', min: 0.3, max: 3, step: 0.05, def: 1, fmt: X2 },
+    { k: 'size', label: 'Zoom', min: 0.4, max: 2.2, step: 0.05, def: 1, fmt: X2 },
     { k: 'drift', label: 'Drift', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
     { k: 'opacity', label: 'Opacity', min: 0.2, max: 2, step: 0.05, def: 1, fmt: X2 },
     { k: 'palette', label: 'Palette', def: 'deep',
       opts: [['deep', 'Deep space'], ['accent', 'Accent'], ['ember', 'Ember'], ['ice', 'Ice']] },
+  ],
+  glyphField: [
+    { k: 'source', label: 'Shows', def: 'clock',
+      opts: [['clock', 'Clock'], ['date', 'Date'], ['text', 'Your text']] },
+    { k: 'text', label: 'Text — {time} / {date} substitute', type: 'text', def: 'ZENITH {time}',
+      when: v => v('source') === 'text' },
+    { k: 'secs', label: 'Seconds', def: 'on', when: v => v('source') !== 'date',
+      opts: [['on', 'Show'], ['off', 'Hide']] },
+    { k: 'clock12', label: '12-hour', def: 'off', when: v => v('source') !== 'date',
+      opts: [['off', '24h'], ['on', '12h']] },
+    { k: 'font', label: 'Typeface', def: 'display',
+      opts: [['display', 'Display'], ['mono', 'Mono'], ['system', 'System']] },
+    { k: 'size', label: 'Size', min: 0.2, max: 1, step: 0.05, def: 0.8, fmt: PCT },
+    { k: 'nodes', label: 'Nodes', min: 40, max: 1200, step: 20, def: 380, fmt: v => v },
+    { k: 'link', label: 'Link range', min: 10, max: 120, step: 5, def: 34, fmt: PX },
+    { k: 'dot', label: 'Node size', min: 0.3, max: 3, step: 0.1, def: 1, fmt: X1 },
+    { k: 'drift', label: 'Drift', min: 0, max: 4, step: 0.1, def: 1, fmt: X1 },
+    { k: 'fill', label: 'Fill the shape', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
+    { k: 'dots', label: 'Nodes', def: 'on', opts: [['on', 'Show'], ['off', 'Hide']] },
+    { k: 'lines', label: 'Lines', def: 'on', opts: [['on', 'Show'], ['off', 'Hide']] },
+    { k: 'morph', label: 'On change', def: 'flow',
+      opts: [['flow', 'Flow into it'], ['snap', 'Jump']] },
+    { k: 'speed', label: 'Transition speed', min: 0.1, max: 4, step: 0.1, def: 1, fmt: X1,
+      when: v => v('morph') === 'flow' },
+    { k: 'outline', label: 'Outline', def: 'off', opts: [['off', 'Hidden'], ['on', 'Visible']] },
+    { k: 'opacity', label: 'Opacity', min: 0.2, max: 2, step: 0.05, def: 1, fmt: X2 },
   ],
   solarSystem: [
     { k: 'planets', label: 'Planets', min: 2, max: 8, step: 1, def: 7, fmt: v => v },
@@ -3285,6 +3866,12 @@ const FX_SPECS = {
     { k: 'gather', label: 'Attraction at gravity end', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
     { k: 'scatter', label: 'Repulsion at far end', min: 0, max: 3, step: 0.1, def: 1, fmt: X1 },
     { k: 'blob', label: 'Blob size', min: 0.4, max: 3, step: 0.1, def: 1, fmt: X2 },
+    // Three things get drawn per frame and they are worth separating: the soft halo, the
+    // hard bright core inside it, and the webbing between neighbours. Halo alone reads as
+    // lava; add the cores and it reads as nodes; add the lines and it reads as a network.
+    { k: 'halo', label: 'Blob glow', def: 'on', opts: [['on', 'On'], ['off', 'Off']] },
+    { k: 'cores', label: 'Blob cores', def: 'on', opts: [['on', 'On'], ['off', 'Off']] },
+    { k: 'lines', label: 'Connection lines', def: 'on', opts: [['on', 'On'], ['off', 'Off']] },
     { k: 'opacity', label: 'Opacity', min: 0.2, max: 2, step: 0.05, def: 1, fmt: X2 },
     { k: 'cold', label: 'Cold colour', type: 'color', def: '#2f6bff' },
     { k: 'hot', label: 'Hot colour', type: 'color', def: '#ff5d3c' },
@@ -3293,6 +3880,11 @@ const FX_SPECS = {
     { k: 'nodes', label: 'Stars', min: 15, max: 1000, step: 5, def: 60, fmt: v => v },
     { k: 'link', label: 'Link range', min: 60, max: 600, step: 10, def: 170, fmt: v => v + 'px' },
     { k: 'speed', label: 'Drift', min: 0, max: 10, step: 0.1, def: 1, fmt: X1 },
+    // an always-on brake: turn it down and the field slows immediately, whatever energy
+    // it was carrying and whether or not gravity is running
+    { k: 'maxv', label: 'Speed limit', min: 0.2, max: 12, step: 0.2, def: 6, fmt: X1 },
+    { k: 'dots', label: 'Nodes', def: 'on', opts: [['on', 'Show'], ['off', 'Hide']] },
+    { k: 'lines', label: 'Lines', def: 'on', opts: [['on', 'Show'], ['off', 'Hide']] },
     { k: 'opacity', label: 'Opacity', min: 0.2, max: 2, step: 0.05, def: 1, fmt: X2 },
     { k: 'grav', label: 'Gravity', def: 'off', opts: [['off', 'Off'], ['on', 'On']] },
     // the old 0.1-6 range put every visible difference in its first fifth; measured
@@ -3367,7 +3959,7 @@ const FX_SPECS = {
    someone opened that one panel. MOUSE_AWARE lists the effects that actually respond to
    the cursor — offering the toggle on an effect that ignores it would be a lie. */
 const MOUSE_AWARE = new Set(['stars', 'constellations', 'codeRain', 'radar', 'circuit',
-  'deepNebula', 'solarSystem', 'aurora', 'flybys']);
+  'deepNebula', 'solarSystem', 'aurora', 'flybys', 'glyphField', 'lavaLamp']);
 /* Colour is only OFFERED where it actually lands. A per-effect hue reaches the canvas
    through _fxRGB(), which most effects use but several do not: the CSS-driven layers take
    var(--acc) from the stylesheet, the lava lamp has its own cold/hot pair, and the flyby
@@ -3376,7 +3968,7 @@ const MOUSE_AWARE = new Set(['stars', 'constellations', 'codeRain', 'radar', 'ci
    MOUSE_AWARE, and fx-vars.test.mjs pins this set against the effects that really use
    _fxRGB so the two cannot drift. */
 const COLOUR_AWARE = new Set(['stars', 'constellations', 'codeRain', 'radar', 'circuit',
-  'deepNebula', 'solarSystem', 'aurora']);
+  'deepNebula', 'solarSystem', 'aurora', 'glyphField']);
 for (const [key, spec] of Object.entries(FX_SPECS)) {
   if (key === 'mouse') continue;                     // the cursor does not act on itself
   if (COLOUR_AWARE.has(key)) {
@@ -3488,65 +4080,128 @@ function fxHueOf(key) {
   return P.col === 'custom' ? (P.hue !== undefined ? P.hue : 190) : null;
 }
 
-/* --- distant nebulae -----------------------------------------------------------
-   Each cloud is THREE offset radial gradients rather than one circle: a single
-   gradient always reads as a perfect disc, and real nebulae are lumpy. A darker
-   fourth lobe carves a dust lane so the shape has some internal structure. */
+/* --- distant nebulae -------------------------------------------------------------
+   Real nebulae are a turbulent DENSITY FIELD, not a pile of soft discs. The previous
+   version drew a handful of overlapping radial gradients, which always reads as blobs
+   however low you take the alpha, and at 16% it barely read at all.
+
+   So the gas is baked from fractal noise into a small offscreen canvas, then drawn
+   scaled up. Three things fall out of that for free:
+     · filaments — ridged noise (1 - |2n-1|) makes creases where plain fbm makes lumps,
+       and the wispiness control is just the exponent on those creases
+     · dust lanes — a second, independent field SUBTRACTS opacity, which is what dark
+       nebulae physically are: foreground dust absorbing what is behind it
+     · softness — upscaling a low-res texture is a free high-quality blur, so there is
+       no per-pixel blur pass and no shadowBlur anywhere
+
+   The bake is ~4ms at 1/6 scale and only re-runs when a shape control actually moves
+   (see `sig`), so dragging a slider restructures the gas and steady state costs two
+   drawImage calls a frame. Motion comes from drawing that one texture twice at
+   different zooms drifting against each other: the overlap keeps changing, so the
+   structure evolves instead of sliding past as a rigid sheet. */
 const NEB_PAL = {
   deep: ['150,110,255', '255,110,170', '90,180,255', '120,90,230', '200,120,255'],
   ember: ['255,140,80', '255,90,90', '255,190,110', '230,80,140', '255,120,60'],
   ice: ['120,200,255', '150,240,255', '90,160,255', '190,220,255', '110,255,235'],
 };
-let _nebSeeds = null, _nebN = null;
-FX_BACK.deepNebula = (x, w, h, t, a) => {
-  const P = fxp('deepNebula'), n = P.clouds;
-  if (!_nebSeeds || _nebN !== n) {
-    _nebSeeds = Array.from({ length: n }, (_, i) => ({
-      x: Math.random(), y: Math.random() * 0.85, i,
-      r: 0.20 + Math.random() * 0.26, sp: 0.005 + Math.random() * 0.012,
-      ph: Math.random() * 6.283,
-      lobes: Array.from({ length: 3 }, () => ({
-        dx: (Math.random() - 0.5) * 0.7, dy: (Math.random() - 0.5) * 0.7,
-        s: 0.45 + Math.random() * 0.55 })),
-    }));
-    _nebN = n;
-  }
-  const pal = P.palette === 'accent' ? null : (NEB_PAL[P.palette] || NEB_PAL.deep);
-  const A = 0.16 * a * P.opacity;
-  x.save(); x.globalCompositeOperation = 'lighter';
-  // the clouds have a fixed anchor plus a sine wobble, so the cursor displaces the whole
-  // cloud and it drifts back — the gas parts around the pointer like smoke
-  const NM = fxMouse('deepNebula');
-  for (const s of _nebSeeds) {
-    const col = pal ? pal[s.i % pal.length] : _fxRGB(0.1 + (s.i % 3) * 0.12);
-    let cx = (s.x + Math.sin(t * s.sp * P.drift + s.ph) * 0.06) * w;
-    let cy = (s.y + Math.cos(t * s.sp * 0.7 * P.drift + s.ph) * 0.04) * h;
-    if (NM) {
-      const mf = fxMouseAt(NM, cx + (s.ox || 0), cy + (s.oy || 0));
-      springStep(s, mf.fx * 2.4, mf.fy * 2.4, 0.03, 0.93, Math.min(w, h) * 0.5);
-    } else if (s.ox) springStep(s, 0, 0, 0.03, 0.93, Math.min(w, h) * 0.5);
-    cx += s.ox || 0; cy += s.oy || 0;
-    const R = s.r * Math.min(w, h) * P.size;
-    for (const L of s.lobes) {
-      const lx = cx + L.dx * R * 0.55, ly = cy + L.dy * R * 0.55, lr = R * L.s;
-      const g = x.createRadialGradient(lx, ly, 0, lx, ly, lr);
-      g.addColorStop(0, `rgba(${col},${A})`);
-      g.addColorStop(0.4, `rgba(${col},${A * 0.42})`);
-      g.addColorStop(1, `rgba(${col},0)`);
-      x.fillStyle = g; x.beginPath(); x.arc(lx, ly, lr, 0, 7); x.fill();
+// integer hash -> [0,1). Deterministic, so the same settings rebuild the same nebula.
+function _nhash(ix, iy, sd) {
+  let n = (Math.imul(ix, 374761393) + Math.imul(iy, 668265263) + Math.imul(sd, 1274126177)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+function _vnoise(x, y, sd) {                       // bilinear value noise, smoothstepped
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  const a = _nhash(x0, y0, sd), b = _nhash(x0 + 1, y0, sd);
+  const c = _nhash(x0, y0 + 1, sd), d = _nhash(x0 + 1, y0 + 1, sd);
+  const t1 = a + (b - a) * sx, t2 = c + (d - c) * sx;
+  return t1 + (t2 - t1) * sy;
+}
+function _nfbm(x, y, oct, sd) {
+  let v = 0, amp = 0.5, f = 1, norm = 0;
+  for (let i = 0; i < oct; i++) { v += amp * _vnoise(x * f, y * f, sd + i * 17); norm += amp; amp *= 0.5; f *= 2; }
+  return v / norm;
+}
+let _neb = null, _nebSig = '';
+// `ramp` is a list of "r,g,b" strings; the gas picks along it by a slow third field, so
+// colour varies across the cloud the way emission lines do instead of being one flat tint.
+function _bakeNebula(w, h, P, ramp) {
+  const S = 6;
+  const cw = Math.max(64, Math.ceil(w / S)), ch = Math.max(36, Math.ceil(h / S));
+  const cvs = document.createElement('canvas'); cvs.width = cw; cvs.height = ch;
+  const ctx = cvs.getContext('2d');
+  const img = ctx.createImageData(cw, ch), d = img.data;
+  const cols = ramp.map(c => c.split(',').map(Number));
+  const oct = Math.round(P.detail), freq = 7 / Math.max(0.05, P.scale);
+  const floor = 1 - P.coverage;
+  for (let y = 0; y < ch; y++) {
+    for (let xp = 0; xp < cw; xp++) {
+      const u = xp / cw, v = y / ch;
+      // ridged: creases, not lumps — this is what makes it look like gas
+      let n = 1 - Math.abs(2 * _nfbm(u * freq * 1.7, v * freq, oct, 11) - 1);
+      n = Math.pow(n < 0 ? 0 : n, P.contrast);
+      let al = (n - floor) / Math.max(0.001, P.coverage);
+      // Large-scale envelope. Without it the filaments tile the whole frame like marble;
+      // a real nebula is mostly dark sky with the gas gathered into a few regions, and
+      // that separation of scales — big envelope times fine structure — is what sells it.
+      const env = _nfbm(u * freq * 0.26 + 3, v * freq * 0.21 + 7, 3, 5);
+      let mask = (env - (1 - P.spread)) / Math.max(0.001, P.spread);
+      mask = mask <= 0 ? 0 : mask * mask;
+      al *= mask;
+      if (al > 0) {
+        if (P.dust > 0) {                          // foreground dust absorbs
+          const dn = 1 - Math.abs(2 * _nfbm(u * freq * 2.3 + 31, v * freq * 1.4 + 17,
+            Math.max(2, oct - 1), 77) - 1);
+          al *= 1 - P.dust * dn * dn;
+        }
+        const cf = _nfbm(u * freq * 0.45 + 5, v * freq * 0.32 + 9, 2, 41) * (cols.length - 1);
+        const ci = Math.min(cols.length - 2, Math.floor(cf)), k = cf - ci;
+        const c0 = cols[ci], c1 = cols[ci + 1];
+        const i4 = (y * cw + xp) * 4;
+        d[i4] = c0[0] + (c1[0] - c0[0]) * k;
+        d[i4 + 1] = c0[1] + (c1[1] - c0[1]) * k;
+        d[i4 + 2] = c0[2] + (c1[2] - c0[2]) * k;
+        d[i4 + 3] = (al > 1 ? 1 : al) * 255;
+      }
     }
   }
+  ctx.putImageData(img, 0, 0);
+  return cvs;
+}
+FX_BACK.deepNebula = (x, w, h, t, a) => {
+  const P = fxp('deepNebula');
+  // _fxRGB is read here, in the draw body, so the Accent palette follows a per-effect hue
+  const ramp = P.palette === 'accent'
+    ? [_fxRGB(0), _fxRGB(0.3), _fxRGB(0.12), _fxRGB(0.45), _fxRGB(0.2)]
+    : (NEB_PAL[P.palette] || NEB_PAL.deep);
+  const sig = [w, h, P.scale, P.detail, P.contrast, P.coverage, P.spread, P.dust, ramp.join('|')].join(',');
+  if (!_neb || _nebSig !== sig) { _neb = _bakeNebula(w, h, P, ramp); _nebSig = sig; }
+
+  const A = 0.85 * a * P.opacity * P.gain;   // was 0.16 flat, which is why it barely showed
+  const NM = fxMouse('deepNebula');
+  if (NM) {                                  // the whole sheet parts around the cursor
+    const mf = fxMouseAt(NM, w * 0.5 + (_neb.ox || 0), h * 0.5 + (_neb.oy || 0));
+    springStep(_neb, mf.fx * 1.8, mf.fy * 1.8, 0.02, 0.94, Math.min(w, h) * 0.25);
+  } else if (_neb.ox) springStep(_neb, 0, 0, 0.02, 0.94, Math.min(w, h) * 0.25);
+  const mx = _neb.ox || 0, my = _neb.oy || 0;
+
+  x.save();
+  x.globalCompositeOperation = 'lighter';
+  x.imageSmoothingEnabled = true;            // the upscale IS the blur
+  // two passes at different zooms drifting opposite ways: where they overlap the gas
+  // thickens, and because the overlap keeps moving the structure evolves
+  const pass = (zoom, rate, ph, alpha) => {
+    const dw = w * zoom, dh = h * zoom;
+    const ox = (w - dw) / 2 + Math.sin(t * rate * P.drift + ph) * (dw - w) * 0.4;
+    const oy = (h - dh) / 2 + Math.cos(t * rate * 0.76 * P.drift + ph) * (dh - h) * 0.4;
+    x.globalAlpha = Math.min(1, alpha);
+    x.drawImage(_neb, ox + mx, oy + my, dw, dh);
+  };
+  pass(1.45 * P.size, 0.021, 0, A);
+  pass(2.15 * P.size, -0.013, 2.1, A * 0.62);
+  x.globalAlpha = 1;
   x.restore();
-  // dust lane: a soft dark wedge subtracted from the brightest cloud
-  const s0 = _nebSeeds[0];
-  if (s0) {
-    const cx = s0.x * w, cy = s0.y * h, R = s0.r * Math.min(w, h) * P.size;
-    const g = x.createLinearGradient(cx - R, cy, cx + R, cy + R * 0.4);
-    g.addColorStop(0, 'rgba(2,6,10,0)');
-    g.addColorStop(0.5, `rgba(2,6,10,${0.30 * a})`);
-    g.addColorStop(1, 'rgba(2,6,10,0)');
-    x.fillStyle = g; x.beginPath(); x.ellipse(cx, cy, R, R * 0.32, 0.5, 0, 7); x.fill();
-  }
 };
 
 /* --- aurora ---------------------------------------------------------------------
@@ -3741,6 +4396,24 @@ FX_BACK.constellations = (x, w, h, t, a) => {
       p.vx += f.fx * 0.5; p.vy += f.fy * 0.5;
     }
   }
+  /* Speed governor. stepGravity damps and caps, but ONLY while gravity is on — switch it
+     off and every node keeps whatever velocity it had reached, forever, because nothing
+     else in the loop touches vx/vy. Drift then multiplies that frozen speed, so a field
+     that had been flung about under gravity stayed flung with no way to calm it down.
+     Two parts: a hard limit that always applies, so the slider is an immediate brake at
+     any moment; and, with gravity off, a bleed back toward the gentle speed the field is
+     seeded with, so the energy gravity left behind drains away in a second or two on its
+     own. The bleed is deliberately not applied while gravity is on — there, motion IS
+     the effect and damping it would fight the simulation. */
+  const CALM = 0.08;                       // the magnitude nodes are created with
+  for (const p of _cNodes) {
+    const sp = Math.hypot(p.vx, p.vy);
+    if (sp > P.maxv) { const k = P.maxv / sp; p.vx *= k; p.vy *= k; }
+    else if (P.grav !== 'on' && sp > CALM) {
+      const k = Math.max(CALM / sp, 0.96);
+      p.vx *= k; p.vy *= k;
+    }
+  }
   for (const p of _cNodes) {
     p.x += p.vx * P.speed; p.y += p.vy * P.speed;
     // reflect off the edges rather than just flipping the sign: under gravity a node can
@@ -3751,29 +4424,37 @@ FX_BACK.constellations = (x, w, h, t, a) => {
     if (p.y < 0) { p.y = 0; p.vy = Math.abs(p.vy); }
     else if (p.y > h) { p.y = h; p.vy = -Math.abs(p.vy); }
   }
-  const lines = [], dots = [];
-  for (let b = 0; b < CBANDS; b++) { lines.push(new Path2D()); dots.push(new Path2D()); }
-  eachLinkedPair(_cNodes, LINK, w, h, (p, q, d) => {
-    const f = Math.pow(1 - d / LINK, 1.6);            // same falloff as before, quantised
-    const b = Math.min(CBANDS - 1, (f * CBANDS) | 0);
-    lines[b].moveTo(p.x, p.y); lines[b].lineTo(q.x, q.y);
-  });
-  x.lineWidth = 1;
-  for (let b = 0; b < CBANDS; b++) {
-    x.strokeStyle = `rgba(${rgb},${((b + 0.5) / CBANDS) * 0.24 * A})`;
-    x.stroke(lines[b]);
+  // With the lines hidden the pair search has nothing to feed, so the whole pass is
+  // skipped rather than drawn invisibly — it is the expensive half of this effect.
+  if (P.lines !== 'off') {
+    const lines = [];
+    for (let b = 0; b < CBANDS; b++) lines.push(new Path2D());
+    eachLinkedPair(_cNodes, LINK, w, h, (p, q, d) => {
+      const f = Math.pow(1 - d / LINK, 1.6);            // same falloff as before, quantised
+      const b = Math.min(CBANDS - 1, (f * CBANDS) | 0);
+      lines[b].moveTo(p.x, p.y); lines[b].lineTo(q.x, q.y);
+    });
+    x.lineWidth = 1;
+    for (let b = 0; b < CBANDS; b++) {
+      x.strokeStyle = `rgba(${rgb},${((b + 0.5) / CBANDS) * 0.24 * A})`;
+      x.stroke(lines[b]);
+    }
   }
-  for (const p of _cNodes) {
-    const tw = 0.72 + 0.28 * Math.sin(t * 1.7 + p.tw);   // 0.44 .. 1.00
-    const b = Math.min(CBANDS - 1, Math.max(0, ((tw - 0.44) / 0.56 * CBANDS) | 0));
-    // sqrt so a 40x mass reads as ~6x the radius rather than a disc that eats the screen
-    const rad = p.gm > 1 ? p.m * Math.sqrt(p.gm) : p.m;
-    dots[b].moveTo(p.x + rad, p.y);                      // moveTo first, else the arcs join up
-    dots[b].arc(p.x, p.y, rad, 0, 7);
-  }
-  for (let b = 0; b < CBANDS; b++) {
-    x.fillStyle = `rgba(${rgb},${0.55 * A * (0.44 + ((b + 0.5) / CBANDS) * 0.56)})`;
-    x.fill(dots[b]);
+  if (P.dots !== 'off') {
+    const dots = [];
+    for (let b = 0; b < CBANDS; b++) dots.push(new Path2D());
+    for (const p of _cNodes) {
+      const tw = 0.72 + 0.28 * Math.sin(t * 1.7 + p.tw);   // 0.44 .. 1.00
+      const b = Math.min(CBANDS - 1, Math.max(0, ((tw - 0.44) / 0.56 * CBANDS) | 0));
+      // sqrt so a 40x mass reads as ~6x the radius rather than a disc that eats the screen
+      const rad = p.gm > 1 ? p.m * Math.sqrt(p.gm) : p.m;
+      dots[b].moveTo(p.x + rad, p.y);                      // moveTo first, else the arcs join up
+      dots[b].arc(p.x, p.y, rad, 0, 7);
+    }
+    for (let b = 0; b < CBANDS; b++) {
+      x.fillStyle = `rgba(${rgb},${0.55 * A * (0.44 + ((b + 0.5) / CBANDS) * 0.56)})`;
+      x.fill(dots[b]);
+    }
   }
 };
 
@@ -3843,20 +4524,28 @@ FX_BACK.lavaLamp = (x, w, h, t, a) => {
   }
   x.save();
   x.globalCompositeOperation = 'lighter';
-  // links first, so blobs sit on top of the webbing
-  x.lineWidth = 1;
-  for (let i = 0; i < n; i++) {
-    const p = _lava[i];
-    for (let j = i + 1; j < n; j++) {
-      const q = _lava[j], dx = q.x - p.x, dy = q.y - p.y, d2 = dx * dx + dy * dy;
-      if (d2 > L2) continue;
-      const d = Math.sqrt(d2), u = (uOf(p) + uOf(q)) * 0.5;
-      x.strokeStyle = `rgba(${_mixHex(P.cold, P.hot, u)},${Math.pow(1 - d / L, 1.7) * 0.30 * A})`;
-      x.beginPath(); x.moveTo(p.x, p.y); x.lineTo(q.x, q.y); x.stroke();
+  // links first, so blobs sit on top of the webbing. Skipping the whole pass when they are
+  // off is the point: it is the second O(n^2) sweep of the frame, and at 220 blobs it is
+  // the most expensive thing here.
+  if (P.lines !== 'off') {
+    x.lineWidth = 1;
+    for (let i = 0; i < n; i++) {
+      const p = _lava[i];
+      for (let j = i + 1; j < n; j++) {
+        const q = _lava[j], dx = q.x - p.x, dy = q.y - p.y, d2 = dx * dx + dy * dy;
+        if (d2 > L2) continue;
+        const d = Math.sqrt(d2), u = (uOf(p) + uOf(q)) * 0.5;
+        x.strokeStyle = `rgba(${_mixHex(P.cold, P.hot, u)},${Math.pow(1 - d / L, 1.7) * 0.30 * A})`;
+        x.beginPath(); x.moveTo(p.x, p.y); x.lineTo(q.x, q.y); x.stroke();
+      }
     }
   }
+  const LM = fxMouse('lavaLamp');
   for (let i = 0; i < n; i++) {
     const p = _lava[i], u = uOf(p);
+    // the cursor stirs the lamp: scaled like the gravity term below, so a shove reads as
+    // comparable to the buoyancy already moving the blob rather than swamping it
+    if (LM) { const mf = fxMouseAt(LM, p.x, p.y); p.vx += mf.fx * 40 * dt; p.vy += mf.fy * 40 * dt; }
     // mass lifts: at/above the threshold buoyancy exceeds gravity and the clot climbs
     const lift = Math.min(2.2, near[i] / Math.max(1, P.clump));
     const g = (1 - lift) >= 0 ? (1 - lift) * P.fall : (1 - lift) * P.rise;
@@ -3888,15 +4577,281 @@ FX_BACK.lavaLamp = (x, w, h, t, a) => {
     }
     const col = _mixHex(P.cold, P.hot, u);
     const R = (7 + near[i] * 1.5) * p.r * P.blob;        // a well-connected blob reads as bigger
-    const gr = x.createRadialGradient(p.x, p.y, 0, p.x, p.y, R);
-    gr.addColorStop(0, `rgba(${col},${0.55 * A})`);
-    gr.addColorStop(0.45, `rgba(${col},${0.20 * A})`);
-    gr.addColorStop(1, `rgba(${col},0)`);
-    x.fillStyle = gr; x.beginPath(); x.arc(p.x, p.y, R, 0, 7); x.fill();
-    x.fillStyle = `rgba(${col},${0.5 * A})`;   // bright core
-    x.beginPath(); x.arc(p.x, p.y, 1.6 * p.r * P.blob, 0, 7); x.fill();
+    if (P.halo !== 'off') {
+      const gr = x.createRadialGradient(p.x, p.y, 0, p.x, p.y, R);
+      gr.addColorStop(0, `rgba(${col},${0.55 * A})`);
+      gr.addColorStop(0.45, `rgba(${col},${0.20 * A})`);
+      gr.addColorStop(1, `rgba(${col},0)`);
+      x.fillStyle = gr; x.beginPath(); x.arc(p.x, p.y, R, 0, 7); x.fill();
+    }
+    if (P.cores !== 'off') {
+      x.fillStyle = `rgba(${col},${0.5 * A})`;   // bright core
+      x.beginPath(); x.arc(p.x, p.y, 1.6 * p.r * P.blob, 0, 7); x.fill();
+    }
   }
   x.restore();
+};
+
+/* --- glyph field ------------------------------------------------------------------
+   A constellation held INSIDE letterforms. The glyphs are a containment mask, not
+   something drawn: text is rendered once to a small offscreen canvas, its alpha read
+   into a byte array, and the list of covered pixels becomes both the region nodes are
+   allowed to occupy and the pool their home positions are sampled from.
+
+   Two things make this read as one object rather than as dots in a stencil:
+
+   MORPH. Every node keeps a home. When the text changes — a clock ticking, or the user
+   typing — homes are RESAMPLED and each node eases from its old one to its new one, so
+   the field flows into the next digit instead of cutting to it. Nodes are matched to
+   the nearest free target rather than at random, which is what stops the transition
+   looking like a shuffle: most of a '3' is also part of an '8', so most nodes barely
+   move and only the changed strokes travel.
+
+   CONTAINMENT. A node's proposed position is tested against the mask each frame and
+   reflected if it lands outside, so drift explores the letterform and stops at its
+   edge. Drift 0 leaves them still, which is a legitimate look rather than a broken one.
+
+   The mask is rebuilt only when the STRING changes, so a clock costs one rebuild a
+   second and everything between is O(n) motion plus the shared spatial-hash link pass. */
+const GLYPH_FONTS = { display: '--disp', mono: '--mono', system: null };
+let _gf = null;
+function _glyphFontCss(kind, px) {
+  const v = GLYPH_FONTS[kind];
+  let fam = 'system-ui,-apple-system,sans-serif';
+  if (v) {
+    const got = getComputedStyle(document.body).getPropertyValue(v).trim();
+    if (got) fam = got;
+  }
+  return `700 ${px}px ${fam}`;
+}
+function _glyphMask(text, kind, sizeFrac, w, h) {
+  const S = 2;                                   // mask at half resolution: plenty for hit tests
+  const mw = Math.max(16, Math.round(w / S)), mh = Math.max(16, Math.round(h / S));
+  const c = document.createElement('canvas'); c.width = mw; c.height = mh;
+  const g = c.getContext('2d');
+  // Size is a fraction of the largest that FITS, not an absolute. Measured against a
+  // reference size first: an 8-character clock hits the width limit almost immediately, so
+  // an absolute size was clamped for most of the slider's travel and appeared to do nothing.
+  // TABULAR DIGITS. Every digit is given the same advance — the widest one's — and drawn
+  // centred in that slot. The display face is proportional, so '1' is narrower than '8',
+  // and measuring the LIVE string meant its total width changed every time a digit did.
+  // That fed both the fitted size and the centring, so the whole clock resized a little
+  // and slid sideways on every tick. Slots make the layout depend on the PATTERN of
+  // characters rather than on which digits happen to be showing, so a clock is rock still.
+  const digitAdv = () => { let m = 0; for (let d = 0; d < 10; d++) m = Math.max(m, g.measureText(String(d)).width); return m; };
+  const isDigit = ch => ch >= '0' && ch <= '9';
+  const slot = (ch, dw) => (isDigit(ch) ? dw : g.measureText(ch).width);
+
+  g.font = _glyphFontCss(kind, 100);
+  const dw100 = digitAdv();
+  const w100 = Math.max(1, [...(text || ' ')].reduce((s2, ch) => s2 + slot(ch, dw100), 0));
+  const fit = Math.min(100 * (mw * 0.94) / w100, mh * 0.86);
+  const px = Math.max(8, Math.round(fit * sizeFrac));
+  g.font = _glyphFontCss(kind, px);
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.fillStyle = '#fff';
+  // Laid out CHARACTER BY CHARACTER, keeping each one's x span, so every covered pixel can
+  // be attributed to the glyph it belongs to. That attribution is the whole point: when the
+  // clock ticks, only the characters that actually changed may move their nodes.
+  const dw = digitAdv();
+  const widths = [...text].map(ch => slot(ch, dw));
+  const runW = widths.reduce((s2, v) => s2 + v, 0);
+  const chars = [];
+  let cx = (mw - runW) / 2;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const drawX = cx + (widths[i] - g.measureText(ch).width) / 2;   // centred in its slot
+    chars.push({ ch, x0: cx, x1: cx + widths[i], dx: drawX, pool: [] });
+    g.fillText(ch, drawX, mh / 2);
+    cx += widths[i];
+  }
+  const d = g.getImageData(0, 0, mw, mh).data;
+  const mask = new Uint8Array(mw * mh);
+  for (let i = 0, q = 3; i < mask.length; i++, q += 4) {
+    if (d[q] > 40) {
+      mask[i] = 1;
+      const px2 = i % mw;
+      // a pixel belongs to the character whose advance it falls inside; nearest span wins
+      // for the few that sit in a kerning gap, so no pixel is ever orphaned
+      let best = 0, bd = Infinity;
+      for (let k = 0; k < chars.length; k++) {
+        const ch = chars[k];
+        const dist = px2 < ch.x0 ? ch.x0 - px2 : px2 > ch.x1 ? px2 - ch.x1 : 0;
+        if (dist < bd) { bd = dist; best = k; if (dist === 0) break; }
+      }
+      chars[best].pool.push(i);
+    }
+  }
+  return { mask, mw, mh, S, chars, text, px: px * S };
+}
+const _gfInside = (M, x, y) => {
+  const ix = (x / M.S) | 0, iy = (y / M.S) | 0;
+  if (ix < 0 || iy < 0 || ix >= M.mw || iy >= M.mh) return false;
+  return M.mask[iy * M.mw + ix] === 1;
+};
+// Retarget only the nodes belonging to `ci`. Nearest-free over a handful of probes, which
+// is meaningful now that a pool is one character rather than the whole line — over the
+// full line the probes almost never landed near a node and this degraded to random,
+// which is exactly why every digit used to jump when only the seconds changed.
+function _gfRetarget(nodes, M, ci) {
+  const pool = M.chars[ci] && M.chars[ci].pool;
+  if (!pool || !pool.length) return;
+  const mine = [];
+  for (const p of nodes) if (p.ci === ci) mine.push(p);
+  if (!mine.length) return;
+  // Pick the TARGET SET first, uniformly over the glyph's pixels — which makes it uniform
+  // over its AREA, so every part of the shape gets its share and corners are not skipped.
+  // Only then are nodes matched to those targets by proximity. Doing it the other way
+  // round (each node hunting its own nearest pixel) biases the targets toward where the
+  // nodes already are, which is why a '1' becoming a '2' left the new corners empty.
+  const tx = new Float64Array(mine.length), ty = new Float64Array(mine.length);
+  for (let k = 0; k < mine.length; k++) {
+    const idx = pool[(Math.random() * pool.length) | 0];
+    tx[k] = (idx % M.mw) * M.S; ty[k] = ((idx / M.mw) | 0) * M.S;
+  }
+  const used = new Uint8Array(mine.length);
+  for (const p of mine) {
+    let best = -1, bd = Infinity;
+    for (let k = 0; k < mine.length; k++) {
+      if (used[k]) continue;
+      const dx = tx[k] - p.x, dy = ty[k] - p.y, d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = k; }
+    }
+    if (best < 0) break;
+    used[best] = 1; p.tx = tx[best]; p.ty = ty[best];
+  }
+}
+// Share the nodes out across characters by how much ink each one has, so a 'W' gets more
+// than an 'I' and the field looks evenly dense rather than evenly counted.
+function _gfAllocate(M, want) {
+  const ink = M.chars.map(c => c.pool.length);
+  const sum = ink.reduce((s2, v) => s2 + v, 0) || 1;
+  const out = [];
+  M.chars.forEach((c, i) => {
+    const n = Math.max(c.pool.length ? 3 : 0, Math.round(want * ink[i] / sum));
+    for (let k = 0; k < n; k++) out.push(i);
+  });
+  return out;
+}
+function _gfText(P) {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const h24 = d.getHours();
+  const hh = P.clock12 === 'on' ? (h24 % 12 || 12) : h24;
+  const time = pad(hh) + ':' + pad(d.getMinutes()) + (P.secs === 'on' ? ':' + pad(d.getSeconds()) : '');
+  const date = pad(d.getMonth() + 1) + '/' + pad(d.getDate());
+  if (P.source === 'date') return date;
+  if (P.source === 'text') {
+    // {time} and {date} substitute live, so the field can read "ZENITH {time}" and be both
+    // a label and a clock. Only the characters the substitution changes get retargeted, so
+    // the fixed part of the string never moves.
+    const out = String(P.text || '').slice(0, 40)
+      .replace(/\{time\}/gi, time).replace(/\{date\}/gi, date);
+    return out || ' ';
+  }
+  return time;
+}
+FX_BACK.glyphField = (x, w, h, t, a) => {
+  const P = fxp('glyphField');
+  const text = _gfText(P);
+  // layout signature: anything here moves EVERY character, so the whole field re-seeds
+  const layout = [P.font, P.size, w, h, text.length].join('|');
+  const relaid = !_gf || _gf.layout !== layout;
+  const changed = !_gf || _gf.M.text !== text;
+  if (changed) {
+    const M = _glyphMask(text, P.font, P.size, w, h);
+    const prev = _gf && _gf.M;
+    if (!_gf) _gf = { nodes: [] };
+    _gf.M = M; _gf.layout = layout;
+    const want = Math.round(P.nodes);
+    if (relaid || _gf.want !== want) {            // rebuild the whole population
+      const alloc = _gfAllocate(M, want);
+      _gf.nodes = alloc.map(ci => {
+        const pool = M.chars[ci].pool;
+        const idx = pool[(Math.random() * pool.length) | 0];
+        const hx = (idx % M.mw) * M.S, hy = ((idx / M.mw) | 0) * M.S;
+        return { x: hx, y: hy, tx: hx, ty: hy, ci,
+          vx: (Math.random() - 0.5) * 0.6, vy: (Math.random() - 0.5) * 0.6,
+          m: 0.6 + Math.random() * 1.2 };
+      });
+      _gf.want = want;
+    } else {
+      // Same layout, same node population: retarget ONLY the characters whose glyph
+      // actually differs. A clock ticking from :07 to :08 moves the last digit and leaves
+      // every other node exactly where it was, because their targets are never touched.
+      for (let i = 0; i < M.chars.length; i++) {
+        if (!prev || prev.chars[i] === undefined || prev.chars[i].ch !== M.chars[i].ch) {
+          _gfRetarget(_gf.nodes, M, i);
+        }
+      }
+    }
+  }
+  const M = _gf.M;
+
+  const rgb = _fxRGB(0.1), A = a * P.opacity;
+  // snap teleports to the new glyph; flow eases, and the rate IS the transition speed
+  const ease = P.morph === 'snap' ? 1 : Math.min(1, 0.006 + P.speed * 0.02);
+  const GM = fxMouse('glyphField');
+  for (const p of _gf.nodes) {
+    p.x += (p.tx - p.x) * ease; p.y += (p.ty - p.y) * ease;
+    if (P.drift > 0) {                            // wander, but only where the glyph is
+      p.vx += (Math.random() - 0.5) * 0.35; p.vy += (Math.random() - 0.5) * 0.35;
+      p.vx *= 0.92; p.vy *= 0.92;
+      const nx = p.x + p.vx * P.drift, ny = p.y + p.vy * P.drift;
+      if (_gfInside(M, nx, ny)) { p.x = nx; p.y = ny; }
+      else { p.vx *= -0.6; p.vy *= -0.6; }        // reflect off the letterform's edge
+    }
+    if (GM) { const f = fxMouseAt(GM, p.x, p.y); p.x += f.fx * 0.6; p.y += f.fy * 0.6; }
+  }
+  // FILL. Targets get a node into roughly the right place; this is what makes the field
+  // occupy the shape rather than bunch inside it. Nodes push each other apart, and the
+  // push is rejected if it would leave the glyph, so the crowd relaxes outward until it
+  // presses against the letterform — including into corners a morph under-served. Drift
+  // cannot do this: a random walk wanders, it does not spread.
+  if (P.fill > 0) {
+    for (const p of _gf.nodes) { p.fx = 0; p.fy = 0; }
+    const R = Math.max(6, P.link);
+    eachLinkedPair(_gf.nodes, R, w, h, (p, q, d) => {
+      if (d < 0.001) return;
+      const f = (1 - d / R) * P.fill * 0.55;
+      const ux = (q.x - p.x) / d, uy = (q.y - p.y) / d;
+      p.fx -= ux * f; p.fy -= uy * f;
+      q.fx += ux * f; q.fy += uy * f;
+    });
+    for (const p of _gf.nodes) {
+      const nx = p.x + p.fx, ny = p.y + p.fy;
+      if (_gfInside(M, nx, ny)) { p.x = nx; p.y = ny; }
+      else if (_gfInside(M, nx, p.y)) p.x = nx;   // slide along the edge rather than stall
+      else if (_gfInside(M, p.x, ny)) p.y = ny;
+    }
+  }
+
+  if (P.outline === 'on') {
+    x.save();
+    x.strokeStyle = `rgba(${rgb},${0.30 * A})`; x.lineWidth = 1.25;
+    x.font = _glyphFontCss(P.font, M.px);
+    x.textAlign = 'left'; x.textBaseline = 'middle';
+    for (const c of M.chars) x.strokeText(c.ch, c.dx * M.S, h / 2);
+    x.restore();
+  }
+  if (P.lines !== 'off') {
+    x.lineWidth = 1;
+    const lines = new Path2D();
+    eachLinkedPair(_gf.nodes, P.link, w, h, (p, q) => {
+      lines.moveTo(p.x, p.y); lines.lineTo(q.x, q.y);
+    });
+    x.strokeStyle = `rgba(${rgb},${0.16 * A})`;
+    x.stroke(lines);
+  }
+  if (P.dots !== 'off') {
+    const dots = new Path2D();
+    for (const p of _gf.nodes) {
+      const r = p.m * P.dot;
+      dots.moveTo(p.x + r, p.y); dots.arc(p.x, p.y, r, 0, 7);
+    }
+    x.fillStyle = `rgba(${rgb},${0.75 * A})`;
+    x.fill(dots);
+  }
 };
 
 /* --- code rain --- */
@@ -4419,10 +5374,15 @@ const Caps = {
     if (!req) return true;
     return this.intActive(req);
   },
-  // composition rule (§5.2): app shown = moduleVisible(id) ∧ (non-module OR ≥1 visible tab)
+  // composition rule (§5.2): app shown = moduleVisible(id) ∧ ownGate ∧ (non-module OR ≥1 visible tab)
+  // ownGate: a REQUIRES key with NO dot gates a WHOLE top-level app rather than one tab —
+  // NexusMind is a single app whose every surface (terminal + all six tabs) is one integration,
+  // so gating it tab-by-tab would be six identical entries saying the same thing.
   appVisible(app) {
     if (!app || app.id === 'settings') return true;
     if (!this.moduleVisible(app.id)) return false;
+    const own = (typeof REQUIRES !== 'undefined') && REQUIRES[app.id];
+    if (own && !this.intActive(own)) return false;
     const tabs = app.tabs;
     if (!tabs || !tabs.length) return true;      // standalone app (no tab bar) → visible
     return tabs.some(t => this.tabVisible(app.id, t.key));
@@ -4435,7 +5395,11 @@ Bus.on('caps:changed', () => {
   Dock.render();
   [...WM.wins.values()].forEach(win => {
     const app = win.app;
-    if (!app || !app.tabs) return;                                     // only module windows have a tab bar
+    if (!app) return;
+    if (!app.tabs) {                        // plain app (NexusMind): only "was it just gated off?"
+      if (!Caps.appVisible(app)) WM.close(win);
+      return;
+    }
     const visNow = app.tabs.filter(t => Caps.tabVisible(app.id, t.key)).map(t => t.key);
     const prev = win._visTabs || app.tabs.map(t => t.key);
     const setChanged = visNow.length !== prev.length || visNow.some((k, i) => k !== prev[i]);

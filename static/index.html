@@ -453,6 +453,37 @@ body[data-motion=off] .win.peek-hide{opacity:0}
   background:color-mix(in srgb,var(--acc) 12%,transparent);font-size:13px}
 .win-cwd button.wprompts:hover{color:var(--bright);border-color:var(--acc);
   background:color-mix(in srgb,var(--acc) 24%,transparent)}
+/* ◉ session summary sits in the header proper — between the app icon and the title —
+   because it describes the whole session, not the folder the .win-cwd launchers act on.
+   That means restating .win-cwd button's box here: that rule is parent-scoped, so a
+   button outside the pill inherits none of it. */
+.win-head > button.wsummary{border:1px solid var(--line);border-radius:5px;
+  width:22px;height:22px;padding:0;margin:0 4px 0 2px;
+  font-size:12px;line-height:1;display:grid;place-items:center;
+  color:var(--dim);background:none;cursor:pointer;transition:.12s;flex:none}
+.win-head > button.wsummary:hover{color:var(--acc);border-color:var(--acc);
+  background:color-mix(in srgb,var(--acc) 12%,transparent)}
+.win-head > button.wsummary:active{transform:scale(.93)}
+.win-head > button.wsummary svg{width:14px;height:14px;display:block}
+/* collapsed column strip hides the title; the glyph still reads on its own */
+.win.col-collapsed > .win-head > button.wsummary{margin:2px 0 0 0}
+/* trail rows in the ◉ session-summary panel. Each is a real button — it opens that
+   moment in the transcript — so it needs the hover/active affordance a bare div in an
+   innerHTML string cannot carry, plus the reset a UA stylesheet would otherwise impose
+   (centred text, its own font, a border). */
+.summary-pop .swev{display:grid;grid-template-columns:40px 54px minmax(0,1fr);gap:8px;
+  width:100%;text-align:left;align-items:baseline;padding:5px 4px;margin:0;
+  background:none;border:0;border-top:1px solid rgba(127,127,127,.10);
+  color:var(--text);font:inherit;cursor:pointer;transition:background .1s}
+.summary-pop .swev:hover{background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.summary-pop .swev:active{background:color-mix(in srgb,var(--acc) 18%,transparent)}
+.summary-pop .swev:focus-visible{outline:1px solid var(--acc);outline-offset:-1px}
+/* The clamp lives here rather than inline so the expanded state can lift it — an inline
+   style would win over any class. Three lines keeps eight entries on screen at once. */
+.summary-pop .swev .t{line-height:1.5;overflow:hidden;display:-webkit-box;
+  -webkit-line-clamp:3;-webkit-box-orient:vertical;word-break:break-word}
+.summary-pop .swev.open .t{display:block;-webkit-line-clamp:unset;overflow:visible}
+.summary-pop .swev.open{background:color-mix(in srgb,var(--acc) 6%,transparent)}
 /* fast hover label (250ms) — body-level so .wtitle's overflow:hidden can't clip it */
 .fasttip{position:fixed;z-index:400;font:500 10.5px var(--mono);letter-spacing:normal;
   text-transform:none;color:var(--dim);background:rgba(5,12,18,.94);
@@ -474,6 +505,31 @@ body[data-motion=off] .win.peek-hide{opacity:0}
 .win-desks .wd:hover{color:var(--bright);border-color:var(--line-strong);opacity:1}
 .win-desks .wd.on{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 50%,transparent);
   background:color-mix(in srgb,var(--acc) 12%,transparent);opacity:1}
+/* the same control as a dropdown: one fixed-width box whatever the desktop count, so the
+   title bar does not shrink as desktops are added. Just the number, centred — at this
+   size a caret costs more legibility than the affordance is worth, and the menu is one
+   press away regardless. */
+.win-desks .wdsel{width:22px;height:22px;padding:0;border:1px solid var(--line);border-radius:4px;
+  color:var(--acc);background-color:transparent;font:700 12px var(--disp);line-height:1;
+  display:grid;place-items:center;cursor:pointer;transition:.12s;opacity:.9}
+.win-desks .wdsel:hover{border-color:color-mix(in srgb,var(--acc) 50%,transparent);opacity:1;
+  background-color:color-mix(in srgb,var(--acc) 12%,transparent)}
+.win-desks .wdsel:focus-visible{outline:1px solid var(--acc);outline-offset:1px}
+/* ---- anchored dropdown (openMenu) — a native select popup takes no styling ---- */
+.zmenu{position:fixed;z-index:9000;min-width:118px;padding:4px;display:flex;flex-direction:column;gap:1px;
+  background:var(--panel);backdrop-filter:blur(var(--blur));
+  border:1px solid color-mix(in srgb,var(--acc) 45%,transparent);border-radius:var(--radius);
+  box-shadow:0 14px 40px rgba(0,0,0,.55),0 0 24px color-mix(in srgb,var(--acc) 14%,transparent);
+  animation:zmenuin .12s ease both}
+@keyframes zmenuin{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.zmenu-item{display:block;width:100%;text-align:left;padding:5px 9px;border:1px solid transparent;
+  border-radius:calc(var(--radius) - 4px);background:none;color:var(--dim);cursor:pointer;
+  font:600 10.5px var(--disp);letter-spacing:.06em;transition:.1s;white-space:nowrap}
+.zmenu-item:hover{color:var(--bright);background:color-mix(in srgb,var(--acc) 12%,transparent)}
+.zmenu-item.on{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 40%,transparent);
+  background:color-mix(in srgb,var(--acc) 14%,transparent)}
+.zmenu-item:focus-visible{outline:1px solid var(--acc);outline-offset:-1px}
+body[data-motion=off] .zmenu{animation:none}
 /* dock workspace cluster: desktop pips + mode-cycle button (Option A) */
 #dock .wsc{display:inline-flex;align-items:center;gap:4px;padding:3px;border:1px solid var(--line);
   border-radius:11px;background:color-mix(in srgb,var(--acc) 4%,transparent)}
@@ -836,6 +892,81 @@ table.tbl td{padding:7px 10px;border-bottom:1px solid color-mix(in srgb,var(--ac
    as one lump. Scoped to .mod-win only — every other window keeps win-body's plain
    overflow:auto scroll behavior untouched. */
 .mod-win .win-body{display:flex;flex-direction:column;overflow:hidden}
+/* ---- NexusMind command terminal (ported from NexusMind's own dashboard pane) ----
+   Pinned above the tab strip and never part of the scrolling region: .nm-term is flex:none
+   and .nm-tabs-host takes the rest, so a tab can scroll all it likes and the capture line
+   stays put. Collapsing hides only .nm-term-body, so the titlebar stays reachable. */
+.nm-term{flex:none;margin:10px 12px 0;border:1px solid var(--line-strong);border-radius:var(--radius);
+  background:color-mix(in srgb,var(--bg0) 88%,transparent);overflow:hidden;font-family:var(--mono)}
+.nm-term-bar{display:flex;align-items:center;gap:10px;padding:6px 12px;cursor:pointer;user-select:none;
+  background:color-mix(in srgb,var(--acc) 7%,transparent);border-bottom:1px solid var(--line)}
+.nm-dots{display:flex;gap:6px}
+.nm-dots i{width:9px;height:9px;border-radius:50%;display:block}
+.nm-dots .r{background:#ff5f57}.nm-dots .y{background:#febc2e}.nm-dots .g{background:#28c840}
+.nm-term-title{flex:1;text-align:center;font:600 10.5px var(--disp);letter-spacing:.16em;
+  text-transform:uppercase;color:var(--dim)}
+.nm-term-clear{font:600 9.5px var(--disp);letter-spacing:.14em;color:var(--faint);background:none;
+  border:1px solid var(--line);border-radius:3px;padding:1px 6px;cursor:pointer}
+.nm-term-clear:hover{color:var(--acc);border-color:var(--line-strong)}
+.nm-term-collapse{color:var(--acc);font-size:12px;background:none;border:none;cursor:pointer;
+  padding:0 2px;transition:transform .2s}
+.nm-term.collapsed .nm-term-collapse{transform:rotate(180deg)}
+.nm-term.collapsed .nm-term-body{display:none}
+.nm-term-body{display:flex;flex-direction:column;max-height:360px}
+/* the output pane is genuinely absent until something is asked for — no empty box, just
+   the faint one-line reminder of the grammar (as on NexusMind's own pane) */
+.nm-term-history{flex:1;overflow-y:auto;padding:9px 14px;font-size:12.5px;line-height:1.65;
+  max-height:280px}
+.nm-term-history:empty{padding:7px 14px}
+.nm-term-history:empty::before{content:"output appears here once you ask — ask: · idea: · search · show · help";
+  color:var(--faint);font-size:11px}
+.nm-entry{position:relative;margin-bottom:9px;padding-right:18px}
+.nm-entry-x{position:absolute;top:0;right:0;background:none;border:none;color:var(--faint);
+  font-size:11px;cursor:pointer;padding:0 2px;line-height:1}
+.nm-entry-x:hover{color:var(--acc)}
+.nm-q{color:var(--acc)}
+.nm-a{color:var(--text);white-space:pre-wrap;word-break:break-word}
+.nm-a.muted{color:var(--dim);font-size:11.5px;white-space:normal}
+.nm-a.err{color:#ff8f8f}
+.nm-k{color:var(--acc)}
+.nm-ns{color:#4ef0a6}
+.nm-ok{color:#4ef0a6}
+.nm-h{color:#c084fc}
+.nm-src{font-size:10.5px;color:var(--faint);margin-top:4px}
+.nm-src-i{color:var(--acc);font-size:10px}
+.nm-term-verbose{max-height:150px;overflow-y:auto;padding:5px 9px;margin:2px 12px;border-radius:4px;
+  background:color-mix(in srgb,var(--bg0) 70%,transparent);border:1px solid var(--line);
+  font-size:10.5px;color:var(--dim)}
+.nm-term-verbose .ve{padding:2px 0;border-bottom:1px solid color-mix(in srgb,var(--acc) 5%,transparent)}
+.nm-term-verbose .ve:last-child{border-bottom:0}
+.nm-term-verbose .ve.ok{color:#4ef0a6}
+.nm-term-verbose .ve.err{color:#ff8f8f}
+.nm-term-verbose .vtime{color:var(--faint);margin-right:8px}
+.nm-term-verbose .vms{color:var(--faint)}
+.nm-term-row{display:flex;align-items:center;gap:8px;padding:8px 14px;
+  border-top:1px solid var(--line);background:color-mix(in srgb,var(--bg0) 60%,transparent)}
+.nm-term-prompt{color:var(--acc);font-weight:700;font-size:14px}
+.nm-term-input{flex:1;background:transparent;border:none;color:var(--bright);font-size:13px;
+  font-family:inherit;outline:none;caret-color:var(--acc);padding:0}
+.nm-term-input:focus{border:none;box-shadow:none}
+.nm-term-input::placeholder{color:var(--faint)}
+.nm-term-mic{background:none;border:1px solid var(--line);border-radius:4px;cursor:pointer;
+  font-size:12px;line-height:1;padding:3px 6px;color:var(--dim)}
+.nm-term-mic:hover{border-color:var(--line-strong);color:var(--acc)}
+.nm-term-mic.rec{border-color:#ff5f57;color:#ff8f8f;animation:nmrec 1s infinite}
+.nm-term-mic.busy{opacity:.5}
+@keyframes nmrec{0%,100%{opacity:1}50%{opacity:.4}}
+.nm-term-vtoggle{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;color:var(--dim);
+  cursor:pointer;user-select:none}
+.nm-term-vtoggle input{margin:0;cursor:pointer}
+.nm-term-hints{display:flex;flex-wrap:wrap;gap:5px;padding:6px 14px 8px;
+  border-top:1px solid color-mix(in srgb,var(--acc) 5%,transparent)}
+.nm-chip{font-size:10px;padding:2px 7px;border-radius:3px;cursor:pointer;transition:.15s;
+  background:color-mix(in srgb,var(--acc) 8%,transparent);color:color-mix(in srgb,var(--acc) 65%,var(--dim))}
+.nm-chip:hover{background:color-mix(in srgb,var(--acc) 18%,transparent);color:var(--acc)}
+/* the six MemoryApp tabs live here, below the pinned terminal */
+.nm-tabs-host{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.nm-tabs-host>div{flex:1;min-height:0}
 /* Ops "builder" launch pane: prompt + LAUNCH/SAVE stay pinned to the bottom of the
    window so a streaming console can't push them off-screen; everything else scrolls
    in the region above. Only engages inside .mod-pane once .mod-win makes the height

@@ -14,10 +14,8 @@ Run: python3 server.py   →  http://127.0.0.1:8777
 import atexit
 import base64
 import collections
-import csv
 import glob
 import hashlib
-import io
 import json
 import os
 import platform
@@ -44,6 +42,7 @@ from urllib.parse import urlparse, parse_qs
 
 import zenith_store as zs   # event-store spine (same-dir import; no packaging)
 import zenith_agents as za  # agent adapter layer (P2; same boundary rules)
+import zenith_cases as zc   # cases detectors + sweep loop (same boundary rules)
 
 # Terminal/PTY is the only platform-specific layer. On Unix we use the stdlib
 # pty; on Windows the real-PTY path needs pywinpty (lazy-imported when a terminal
@@ -68,13 +67,17 @@ TRANSCRIPTS_ROOT = CLAUDE_DIR / "projects"
 AGENTS_DIR = CLAUDE_DIR / "agents"
 USER_SKILLS_DIR = CLAUDE_DIR / "skills"
 PLUGINS_DIR = CLAUDE_DIR / "plugins"
-NM_DB = PROJECTS_ROOT / "NexusPrime" / "data" / "nexusprime.db"
-NM_PG_CONN = "postgresql://postgres:postgres@localhost:5432/nexusmind"
-# NexusMind HTTP API (owner-authed). ZENITH runs as a host process and hits the
-# container's PUBLISHED port, so its requests arrive as the docker-gateway IP (not
-# loopback) — the bearer token is REQUIRED. The token is read from a 0600 file
-# (ZENITH_NM_TOKEN_FILE, holding `NM_API_TOKEN=...` or the raw token) or the
-# ZENITH_NM_TOKEN env. See nm_api() below (used by the /api/watchers* proxy routes).
+# Written by the session-watch daemon, never by ZENITH — see session_watch_list().
+SESSION_WATCH_DB = CLAUDE_DIR / "session-watch" / "state.db"
+# ...and the one file in that directory ZENITH DOES own. The watcher re-reads it on
+# every pass, so writing it IS the apply step — see session_watch_config_save().
+SESSION_WATCH_CONFIG = CLAUDE_DIR / "session-watch" / "config.json"
+# NexusMind HTTP API (owner-authed) — the ONE door to memory. ZENITH runs as a host
+# process and hits the container's PUBLISHED port, so its requests arrive as the
+# docker-gateway IP (not loopback) — the bearer token is REQUIRED. The token is read
+# from a 0600 file (ZENITH_NM_TOKEN_FILE, holding `NM_API_TOKEN=...` or the raw token)
+# or the ZENITH_NM_TOKEN env. See nm_api() below; every memory/watcher route goes
+# through it. ZENITH never speaks SQL to NexusMind's schema (see "NexusMind" below).
 ZENITH_NM_API = os.environ.get("ZENITH_NM_API", "http://127.0.0.1:5055")
 ZENITH_NM_TOKEN_FILE = os.environ.get("ZENITH_NM_TOKEN_FILE", "")
 ZENITH_NM_TOKEN_ENV = os.environ.get("ZENITH_NM_TOKEN", "")
@@ -163,7 +166,7 @@ SESSION_NAMES_FILE = DATA_DIR / "session_names.json"   # {transcript_path: custo
 NM_CAPTURE_QUEUE = DATA_DIR / "nm_capture_queue.jsonl"
 CONFIG_FILE = DATA_DIR / "config.json"      # portability/integration config (auto-seeded, gitignored)
 CONFIG = {}                                 # loaded config dict; config_apply() recomputes globals from it
-INTEGRATION_IDS = ("nexusmind", "nexusmind_api", "homelab", "voice", "fleet")
+INTEGRATION_IDS = ("nexusmind_api", "homelab", "voice", "fleet")
 RESEARCH_DIR = DATA_DIR / "research"
 PROPOSALS_DIR = RESEARCH_DIR / "proposals"
 WARGAMES_DIR = DATA_DIR / "wargames"
@@ -266,8 +269,6 @@ _session_cache = {}   # path -> (mtime, size, summary dict)
 _detail_cache = {}    # path -> (mtime, detail dict)
 _projstats_cache = {} # path -> (sig, stats dict)
 _skills_cache = None
-_pg_cache = {"checked": 0.0, "ok": False}
-_pg_lock = threading.Lock()
 
 JOBS = {}             # id -> job dict
 _jobs_lock = threading.Lock()
@@ -305,8 +306,6 @@ def _append_jsonl(path, rec):
 CONFIG_ENV_MAP = {
     "server.port": "ZENITH_PORT",
     "server.bind": "ZENITH_BIND",
-    "integrations.nexusmind.sqlite_db": "ZENITH_NM_DB",
-    "integrations.nexusmind.pg_dsn": "ZENITH_NM_PG",
     "integrations.nexusmind_api.base_url": "ZENITH_NM_API",
     "integrations.nexusmind_api.token_file": "ZENITH_NM_TOKEN_FILE",
     "integrations.nexusmind_api.token": "ZENITH_NM_TOKEN",
@@ -385,17 +384,12 @@ def config_apply(cfg):
     """Recompute the module-level integration globals from cfg using three-layer
     resolution (§2.2). Keeps the exact same global NAMES so every call site is
     unchanged; only the source of each value moves. Paths are expanduser()'d."""
-    global CONFIG, NM_DB, NM_PG_CONN, ZENITH_NM_API, ZENITH_NM_TOKEN_FILE, \
+    global CONFIG, ZENITH_NM_API, ZENITH_NM_TOKEN_FILE, \
         ZENITH_NM_TOKEN_ENV, ZENITH_HOMELAB_DIR, ZENITH_HOMELAB_GIT_USER, \
         FLOWD_URL, WHISPER_MODEL_NAME, PORT, BIND
     CONFIG = cfg or {}
     def g(path):
         return _cfg_get(CONFIG, path)
-    NM_DB = Path(os.path.expanduser(_resolve(
-        "ZENITH_NM_DB", g("integrations.nexusmind.sqlite_db"),
-        "~/claudeProjects/NexusPrime/data/nexusprime.db")))
-    NM_PG_CONN = _resolve("ZENITH_NM_PG", g("integrations.nexusmind.pg_dsn"),
-                          "postgresql://postgres:postgres@localhost:5432/nexusmind")
     ZENITH_NM_API = _resolve("ZENITH_NM_API", g("integrations.nexusmind_api.base_url"),
                              "http://127.0.0.1:5055")
     ZENITH_NM_TOKEN_FILE = os.path.expanduser(_resolve(
@@ -412,6 +406,13 @@ def config_apply(cfg):
                                   g("integrations.voice.whisper_model"), "tiny.en")
     PORT = int(_resolve("ZENITH_PORT", g("server.port"), 8777))
     BIND = _resolve("ZENITH_BIND", g("server.bind"), "127.0.0.1")
+    # The NM base_url/token/mode may have just changed: drop the reachability and
+    # corpus caches so a Settings save re-probes NOW rather than up to 30s later
+    # (capabilities(refresh=True) runs right after this on the config-save path).
+    with _nm_rest_lock:
+        _nm_rest_cache.update(checked=0.0, ok=False, detail="not probed")
+    with _nm_list_lock:
+        _nm_list_cache["rows"] = None
 
 
 def _config_env_overrides():
@@ -1417,92 +1418,97 @@ def read_file_checked(path):
 
 
 # ---------------------------------------------------------------- NexusMind
+# ONE DOOR: every memory read and write goes through NexusMind's HTTP API via
+# nm_api() (bearer token, 5s bound, never throws). ZENITH does NOT talk to the
+# `np` schema directly and must not grow a second path back to it, because a
+# direct-DB reader is worse on every axis that matters:
+#   * retrieval — the API's /api/search is hybrid FTS+semantic fused with RRF
+#     (nDCG@10 0.333); the SQL it replaced was `title ILIKE %q% OR content ILIKE
+#     %q%`, a substring scan that looked like an optimisation while being ~44%
+#     worse at finding things;
+#   * safety — require_principal, row-level ownership, soft-forget/retracted
+#     exclusions and pin-boost scoring all live in NexusMind's application
+#     layer; raw SQL sees rows the API would correctly withhold;
+#   * coupling — `np.memories` is NexusPrime's private shape, and a migration
+#     there would break ZENITH silently.
+# It is also what makes the module work at all here: ZENITH is stdlib-only, this
+# interpreter has no psycopg2 and the host has no psql, so the SQL path could
+# never reach the live store and every memory route answered available:false.
+#
+# GET /api/memories returns the WHOLE corpus as metadata rows (key/title/tags/
+# namespace/created_at/updated_at — no content) ordered by updated_at DESC in
+# ~80ms, so one short-TTL cached fetch feeds browse/meta/graph/timeline and the
+# related-list in detail, and every legacy response shape is preserved exactly.
 
-def nm_connect():
-    if not NM_DB.exists():
-        return None
-    return sqlite3.connect(f"file:{NM_DB}?mode=ro", uri=True, timeout=2)
+NM_BACKEND = "rest"               # the `backend` value every NM payload reports
+NM_LIST_TTL = 30.0                # corpus-list cache; capture invalidates it
+_nm_list_cache = {"at": 0.0, "rows": None}
+_nm_list_lock = threading.Lock()
+_nm_rest_cache = {"checked": 0.0, "ok": False, "detail": "not probed"}
+_nm_rest_lock = threading.Lock()
 
 
-# --- backend detection + unified query -------------------------------------
-# Live memory lives in Postgres (schema `np`); the SQLite file is a frozen
-# March snapshot. nm_query runs a Postgres-flavored SQL (with %s placeholders
-# and np.-qualified tables) against live PG when reachable, else mechanically
-# down-translates it for the SQLite snapshot. All NM readers route through it.
+def _nm_err(r, fallback="nexusmind unreachable"):
+    """A displayable one-line error from an nm_api() result. The bearer token is
+    scrubbed unconditionally: this string reaches the browser and the logs."""
+    msg = fallback
+    if isinstance(r, dict):
+        msg = str(r.get("error") or fallback)
+        if r.get("detail"):
+            msg += ": " + str(r["detail"])
+    tok = _nm_api_token()
+    if tok:
+        msg = msg.replace(tok, "***")
+    return msg[:200]
 
-def _pg_available():
-    with _pg_lock:
+
+def _nm_down():
+    """Why the reachability gate refused, for the routes that surface it — "HTTP
+    401: authentication required" or "connection refused" beats a flat
+    "unreachable" when someone is trying to fix their config. Cached, so this
+    costs nothing; already token-scrubbed by _nm_rest_ok."""
+    return _nm_rest_ok()[1] or "nexusmind unreachable"
+
+
+def _nm_rest_ok():
+    """(reachable, detail) for the NexusMind API, cached ~30s in both directions
+    so a down/slow NM costs one bounded call per half-minute, never a hang."""
+    with _nm_rest_lock:
         now = time.time()
-        if now - _pg_cache["checked"] < 30:
-            return _pg_cache["ok"]
-        ok = False
-        if shutil.which("psql"):
-            try:
-                r = subprocess.run(["psql", NM_PG_CONN, "-tAc", "SELECT 1"],
-                                   capture_output=True, text=True, timeout=3)
-                ok = r.returncode == 0 and r.stdout.strip().startswith("1")
-            except (OSError, subprocess.SubprocessError):
-                ok = False
-        _pg_cache["checked"] = now
-        _pg_cache["ok"] = ok
-        return ok
+        if now - _nm_rest_cache["checked"] < 30:
+            return _nm_rest_cache["ok"], _nm_rest_cache["detail"]
+        # 2.5s bound — shorter than the data paths' 5s, so a cold /api/capabilities
+        # still fits inside CAPS_JOIN (§ capabilities) when NexusMind is down.
+        r = nm_api("/api/namespaces", timeout=2.5)      # cheapest authed read
+        ok = isinstance(r, list)
+        detail = ("api reachable, %d namespaces" % len(r)) if ok else _nm_err(r)
+        _nm_rest_cache.update(checked=now, ok=ok, detail=detail)
+        return ok, detail
 
 
-def nm_backend():
-    if _pg_available():
-        return "postgres"
-    return "sqlite" if NM_DB.exists() else "none"
+def _nm_list(namespace=None):
+    """Every memory as a metadata row, updated_at DESC — or None when NexusMind
+    is unreachable (deliberately distinct from an empty store, so callers can
+    report available:false instead of "no memories")."""
+    with _nm_list_lock:
+        now = time.time()
+        rows = _nm_list_cache["rows"]
+        if rows is None or now - _nm_list_cache["at"] >= NM_LIST_TTL:
+            r = nm_api("/api/memories")
+            if not isinstance(r, list):
+                return None
+            rows = [x for x in r if isinstance(x, dict)]
+            _nm_list_cache.update(at=now, rows=rows)
+    return [r for r in rows if r.get("namespace") == namespace] if namespace else rows
 
 
-def _pg_escape(v):
-    if v is None:
-        return "NULL"
-    if isinstance(v, bool):
-        return "TRUE" if v else "FALSE"
-    if isinstance(v, (int, float)):
-        return str(v)
-    return "'" + str(v).replace("'", "''") + "'"
-
-
-def _pg_query(sql, args=()):
-    parts = sql.split("%s")
-    if len(parts) - 1 != len(args):
-        raise ValueError("placeholder/arg count mismatch")
-    built = parts[0]
-    for p, a in zip(parts[1:], args):
-        built += _pg_escape(a) + p
-    r = subprocess.run(["psql", NM_PG_CONN, "--csv", "-c", built],
-                       capture_output=True, text=True, timeout=8)
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or "psql error").strip())
-    return [dict(row) for row in csv.DictReader(io.StringIO(r.stdout))]
-
-
-def _sqlite_query(sql, args=()):
-    con = nm_connect()
-    if con is None:
-        return None
-    con.row_factory = sqlite3.Row
-    try:
-        s = (sql.replace("np.memories", "memories").replace("np.schedules", "schedules")
-             .replace("np.", "").replace("ILIKE", "LIKE").replace("%s", "?"))
-        return [dict(r) for r in con.execute(s, args).fetchall()]
-    except sqlite3.Error:
-        return None
-    finally:
-        con.close()
-
-
-def nm_query(sql, args=()):
-    """Read query against live Postgres (np schema) if reachable, else the frozen
-    SQLite snapshot. `sql` is Postgres-flavored (%s placeholders, np.-qualified)."""
-    if _pg_available():
-        try:
-            return _pg_query(sql, args)
-        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError):
-            pass   # PG hiccup -> fall through to snapshot
-    rows = _sqlite_query(sql, args)
-    return rows if rows is not None else []
+def _nm_mem(r):
+    """One API row -> the memory dict shape MemoryApp has always consumed. The
+    list endpoint carries no content; the search endpoint does."""
+    return {"key": r.get("key"), "title": r.get("title"),
+            "content": (r.get("content") or "")[:1200],
+            "tags": _parse_tags(r.get("tags")), "namespace": r.get("namespace"),
+            "created_at": r.get("created_at"), "updated_at": r.get("updated_at")}
 
 
 def _parse_tags(v):
@@ -1523,81 +1529,89 @@ def _parse_tags(v):
 
 
 def _nm_reachable():
-    if _int_off("nexusmind"):                 # off → no psql, no file stat (§3.2)
+    """True iff the memory module may talk to NexusMind: the integration is not
+    switched off AND the API actually answers. `off` short-circuits before any
+    socket (§3.2); an unreachable NM reports available:false, never an empty UI."""
+    if _int_off("nexusmind_api"):             # off → no socket at all (§3.2)
         return False
-    return _pg_available() or NM_DB.exists()
+    return _nm_rest_ok()[0]
 
 
-def nm_memories(q=None, namespace=None, limit=60):
+def nm_memories(q=None, namespace=None, limit=60, tag=None):
     if not _nm_reachable():
-        return {"available": False, "memories": []}
+        return {"available": False, "memories": [], "error": _nm_down()}
     limit = max(1, min(int(limit or 60), 300))
-    where, args = [], []
+    if tag:
+        # `show todos` / `list <tag>`: NM's own tag filter, which knows how tags are
+        # stored per backend. Checked before `q` because the two are never combined.
+        r = nm_api("/api/memories?tag=" + urllib.parse.quote(str(tag), safe=""))
+        if not isinstance(r, list):
+            return {"available": False, "memories": [], "error": _nm_err(r)}
+        return {"available": True, "backend": NM_BACKEND,
+                "memories": [_nm_mem(x) for x in r[:limit] if isinstance(x, dict)]}
     if q:
-        where.append("(m.title ILIKE %s OR m.content ILIKE %s)")
-        args += ["%" + q + "%", "%" + q + "%"]
-    if namespace:
-        where.append("m.namespace = %s")
-        args.append(namespace)
-    clause = ("WHERE " + " AND ".join(where) + " ") if where else ""
-    sql = ("SELECT m.key, m.title, m.content, m.tags, m.namespace, m.created_at, "
-           "m.updated_at FROM np.memories m " + clause +
-           "ORDER BY m.updated_at DESC LIMIT %s")
-    args.append(limit)
-    rows = nm_query(sql, args)
-    mems = [{"key": r.get("key"), "title": r.get("title"),
-             "content": (r.get("content") or "")[:1200],
-             "tags": _parse_tags(r.get("tags")), "namespace": r.get("namespace"),
-             "created_at": r.get("created_at"), "updated_at": r.get("updated_at")}
-            for r in rows]
-    return {"available": True, "backend": nm_backend(), "memories": mems}
+        # POST /api/search honours `limit` (GET /api/memories?q= silently caps at
+        # 22) and returns content alongside the metadata.
+        r = nm_api("/api/search", "POST", {"query": q, "namespace": namespace or None,
+                                           "limit": min(limit, 100)})
+        if not isinstance(r, dict) or not isinstance(r.get("results"), list):
+            return {"available": False, "memories": [], "error": _nm_err(r)}
+        rows = r["results"]
+    else:
+        rows = _nm_list(namespace)
+        if rows is None:
+            return {"available": False, "memories": [],
+                    "error": _nm_err(None, "memory list unavailable")}
+        rows = rows[:limit]
+    return {"available": True, "backend": NM_BACKEND,
+            "memories": [_nm_mem(r) for r in rows]}
 
 
 def nm_meta():
     if not _nm_reachable():
-        return {"available": False}
-    try:
-        total = int(nm_query("SELECT COUNT(*) AS c FROM np.memories")[0]["c"])
-    except (IndexError, KeyError, ValueError, TypeError):
-        total = 0
-    ns = nm_query("SELECT namespace, COUNT(*) AS c FROM np.memories "
-                  "GROUP BY namespace ORDER BY c DESC")
-    tag_counts = {}
-    for r in nm_query("SELECT tags FROM np.memories"):
+        return {"available": False, "total": 0, "namespaces": [], "tags": []}
+    rows = _nm_list()
+    if rows is None:
+        return {"available": False, "total": 0, "namespaces": [], "tags": []}
+    ns_counts, tag_counts = {}, {}
+    for r in rows:
+        ns = r.get("namespace")
+        ns_counts[ns] = ns_counts.get(ns, 0) + 1
         for t in _parse_tags(r.get("tags")):
             tag_counts[t] = tag_counts.get(t, 0) + 1
+    top_ns = sorted(ns_counts.items(), key=lambda x: -x[1])
     top_tags = sorted(tag_counts.items(), key=lambda x: -x[1])[:24]
-    return {"available": True, "backend": nm_backend(), "total": total,
-            "namespaces": [{"name": r.get("namespace"), "count": int(r.get("c") or 0)}
-                           for r in ns],
+    return {"available": True, "backend": NM_BACKEND, "total": len(rows),
+            "namespaces": [{"name": n, "count": c} for n, c in top_ns],
             "tags": [{"name": t, "count": c} for t, c in top_tags]}
 
 
 def nm_schedules():
+    """NexusMind's scheduler registry (LoopsApp's NM tab). Same door: GET
+    /api/schedules returns exactly the row shape the old `SELECT * FROM
+    np.schedules` produced, so the response contract is unchanged."""
     if not _nm_reachable():
         return {"available": False, "schedules": []}
-    try:
-        rows = nm_query("SELECT * FROM np.schedules ORDER BY enabled DESC, name")
-        return {"available": True, "backend": nm_backend(), "schedules": rows}
-    except (RuntimeError, ValueError) as e:
-        return {"available": False, "error": str(e), "schedules": []}
+    r = nm_api("/api/schedules")
+    if not isinstance(r, list):
+        return {"available": False, "error": _nm_err(r), "schedules": []}
+    rows = sorted([s for s in r if isinstance(s, dict)],
+                  key=lambda s: (not s.get("enabled"), str(s.get("name") or "")))
+    return {"available": True, "backend": NM_BACKEND, "schedules": rows}
 
 
 def nm_source():
-    total = 0
-    try:
-        total = int(nm_query("SELECT COUNT(*) AS c FROM np.memories")[0]["c"])
-    except (IndexError, KeyError, ValueError, TypeError):
-        total = 0
-    return {"backend": nm_backend(), "memories_total": total}
+    rows = _nm_list() if _nm_reachable() else None
+    if rows is None:
+        return {"backend": "none", "memories_total": 0}
+    return {"backend": NM_BACKEND, "memories_total": len(rows)}
 
 
 def nm_graph(namespace=None, cap=150):
-    where = "WHERE namespace = %s " if namespace else ""
-    args = [namespace] if namespace else []
-    args.append(max(1, min(int(cap or 150), 150)))
-    rows = nm_query("SELECT key, title, namespace, tags FROM np.memories " + where +
-                    "ORDER BY updated_at DESC LIMIT %s", args)
+    rows = _nm_list(namespace) if _nm_reachable() else None
+    if rows is None:
+        return {"backend": "none"}
+    rows = rows[:max(1, min(int(cap or 150), 150))]      # already updated_at DESC
     nodes = [{"key": r.get("key"), "title": r.get("title"),
               "namespace": r.get("namespace"), "tags": _parse_tags(r.get("tags"))}
              for r in rows]
@@ -1612,14 +1626,20 @@ def nm_graph(namespace=None, cap=150):
                 edges.append({"source": nodes[i]["key"], "target": nodes[j]["key"],
                               "weight": len(shared), "shared": sorted(shared)})
     edges.sort(key=lambda e: -e["weight"])
-    return {"backend": nm_backend(), "nodes": nodes, "edges": edges[:800]}
+    return {"backend": NM_BACKEND, "nodes": nodes, "edges": edges[:800]}
 
 
 def nm_timeline(limit=200):
     limit = max(1, min(int(limit or 200), 500))
-    rows = nm_query("SELECT key, title, namespace, created_at FROM np.memories "
-                    "ORDER BY created_at DESC LIMIT %s", [limit])
-    return {"backend": nm_backend(), "items": rows}
+    rows = _nm_list() if _nm_reachable() else None
+    if rows is None:
+        return {"backend": "none", "items": []}
+    # the corpus arrives updated_at DESC; the timeline is keyed on created_at
+    rows = sorted(rows, key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    return {"backend": NM_BACKEND,
+            "items": [{"key": r.get("key"), "title": r.get("title"),
+                       "namespace": r.get("namespace"),
+                       "created_at": r.get("created_at")} for r in rows[:limit]]}
 
 
 def file_memories():
@@ -4799,25 +4819,26 @@ def files_walk(root, q="", exts="", hidden=False, limit=800, flat=True):
 def nm_detail(key):
     if not _nm_reachable():
         return {"available": False}
-    rows = nm_query("SELECT key, title, content, tags, namespace, created_at, "
-                    "updated_at FROM np.memories WHERE key = %s LIMIT 1", [key])
-    if not rows:
-        return {"available": True, "found": False}
-    d = rows[0]
-    tags = _parse_tags(d.get("tags"))
+    r = nm_api("/api/memories/" + urllib.parse.quote(str(key), safe=""))
+    if not isinstance(r, dict) or not r.get("key"):
+        if isinstance(r, dict) and r.get("code") == 404:
+            return {"available": True, "found": False}
+        return {"available": False, "error": _nm_err(r)}
+    tags = _parse_tags(r.get("tags"))
+    d = {k: r.get(k) for k in ("key", "title", "content", "namespace",
+                               "created_at", "updated_at")}
     d["tags"] = tags
     related = []
     if tags:
         tagset = set(tags)
-        others = nm_query("SELECT key, title, tags, namespace, updated_at "
-                          "FROM np.memories WHERE key != %s "
-                          "ORDER BY updated_at DESC LIMIT 400", [key])
-        for r in others:
-            rt = set(_parse_tags(r.get("tags")))
+        for o in (_nm_list() or [])[:400]:          # updated_at DESC, as before
+            if o.get("key") == key:
+                continue
+            rt = set(_parse_tags(o.get("tags")))
             if rt & tagset:
-                related.append({"key": r.get("key"), "title": r.get("title"),
-                                "namespace": r.get("namespace"),
-                                "updated_at": r.get("updated_at"),
+                related.append({"key": o.get("key"), "title": o.get("title"),
+                                "namespace": o.get("namespace"),
+                                "updated_at": o.get("updated_at"),
                                 "shared_tags": sorted(rt & tagset)})
                 if len(related) >= 8:
                     break
@@ -4825,6 +4846,13 @@ def nm_detail(key):
 
 
 def nm_capture(title, content, tags, namespace):
+    """Write a memory through the same one door (POST /api/memories), so the
+    security gate, ownership and embedding pipeline all run. The local JSONL
+    stays as an append-only audit trail of what ZENITH sent. Returns the legacy
+    {"queued", "job"} shape; the route turns queued:false into a real HTTP
+    error so the browser toasts the reason instead of a false success."""
+    if not (content or "").strip():
+        return {"queued": False, "job": None, "error": "content is empty"}
     rec = {"title": title, "content": content, "tags": tags or [],
            "namespace": namespace or "default", "queued": now_iso()}
     try:
@@ -4832,16 +4860,115 @@ def nm_capture(title, content, tags, namespace):
             _append_jsonl(NM_CAPTURE_QUEUE, rec)
     except OSError:
         pass
-    job_id = None
-    nexusprime = Path(os.path.expanduser(_resolve(
-        None, _cfg_get(CONFIG, "integrations.nexusmind.capture_project_dir"),
-        str(PROJECTS_ROOT / "NexusPrime"))))
-    if nexusprime.exists():
-        prompt = ("Store this memory via the nexus-mind MCP np_ingest tool: "
-                  + json.dumps(rec))
-        job_id = spawn_job(str(nexusprime), prompt, model="haiku", mode="default",
-                           label="nm_capture")
-    return {"queued": True, "job": job_id}
+    if not _nm_reachable():
+        return {"queued": False, "job": None, "error": _nm_down()}
+    slug = re.sub(r"[^a-z0-9]+", "_", (title or content).lower()).strip("_")[:48]
+    key = "zenith_%s_%s" % (time.strftime("%Y%m%d_%H%M%S"), slug or "capture")
+    r = nm_api("/api/memories", "POST",
+               {"key": key, "content": content, "title": title or key,
+                "tags": tags or [], "namespace": namespace or "default"})
+    if not isinstance(r, dict) or not r.get("key"):
+        return {"queued": False, "job": None, "error": _nm_err(r, "capture failed")}
+    with _nm_list_lock:                  # the new memory must show up immediately
+        _nm_list_cache["rows"] = None
+    return {"queued": True, "job": None, "key": r["key"]}
+
+
+# ------------------------------------------------- NexusMind terminal (ask/ingest/correct)
+# The NexusMind app's command terminal is a port of NexusMind's own dashboard pane. Its page
+# calls its own origin directly; ZENITH must not — every one of these goes through nm_api(),
+# so the bearer token stays server-side and the `nexusmind_api` switch gates the whole
+# surface. Each returns the same {"available", ...} / {"available": False, "error"} shape the
+# rest of the memory module uses, so one client-side helper can render every failure.
+
+NM_LLM_TIMEOUT = 90          # ask/ingest/correct run classification + an LLM call in NM
+
+
+def nm_ask(question, namespace=None):
+    """POST /api/ask — NM searches its corpus and synthesises an answer."""
+    question = str(question or "").strip()
+    if not question:
+        return {"available": True, "error": "question required", "sources": []}
+    if not _nm_reachable():
+        return {"available": False, "error": _nm_down(), "sources": []}
+    body = {"question": question}
+    if namespace:
+        body["namespace"] = namespace
+    r = nm_api("/api/ask", "POST", body, timeout=NM_LLM_TIMEOUT)
+    if not isinstance(r, dict) or r.get("error"):
+        return {"available": False, "error": _nm_err(r, "ask failed"), "sources": []}
+    return {"available": True, "answer": r.get("answer") or "",
+            "context": r.get("context") or "",
+            "sources": r.get("sources") if isinstance(r.get("sources"), list) else []}
+
+
+def nm_ingest(text, source="zenith", hints=None):
+    """POST /api/ingest — the classifying write path (classify, dedup, entity
+    extraction, auto-linking). Deliberately not POST /api/memories, which skips all
+    four; nm_capture() is the raw-write path and stays separate."""
+    text = str(text or "").strip()
+    if not text:
+        return {"available": True, "error": "text required"}
+    if not _nm_reachable():
+        return {"available": False, "error": _nm_down()}
+    body = {"text": text, "source": source or "zenith"}
+    if hints:
+        body["hints"] = hints
+    r = nm_api("/api/ingest", "POST", body, timeout=NM_LLM_TIMEOUT)
+    if not isinstance(r, dict) or not r.get("key"):
+        return {"available": False, "error": _nm_err(r, "ingest failed")}
+    with _nm_list_lock:                  # the new memory must show up immediately
+        _nm_list_cache["rows"] = None
+    cls = r.get("classification") if isinstance(r.get("classification"), dict) else {}
+    return {"available": True, "key": r.get("key"), "classification": cls,
+            "dedup_action": r.get("dedup_action") or "new",
+            "relationships_created": r.get("relationships_created") or 0}
+
+
+def nm_correct(text, key=None):
+    """POST /api/correct — amend the best-matching existing memory (old version kept
+    by NM's temporal versioning), or store new when nothing matches."""
+    text = str(text or "").strip()
+    if not text:
+        return {"available": True, "error": "text required"}
+    if not _nm_reachable():
+        return {"available": False, "error": _nm_down()}
+    body = {"text": text}
+    if key:
+        body["key"] = key
+    r = nm_api("/api/correct", "POST", body, timeout=NM_LLM_TIMEOUT)
+    if not isinstance(r, dict) or r.get("error"):
+        return {"available": False, "error": _nm_err(r, "correct failed")}
+    with _nm_list_lock:
+        _nm_list_cache["rows"] = None
+    return dict(r, available=True)
+
+
+def nm_stats():
+    """GET /api/stats — NM's own corpus/embedding stats. NM wraps its payload as
+    {status, data, meta}; older builds answered flat, so unwrap either."""
+    if not _nm_reachable():
+        return {"available": False, "error": _nm_down()}
+    r = nm_api("/api/stats")
+    if not isinstance(r, dict) or r.get("error"):
+        return {"available": False, "error": _nm_err(r, "stats failed")}
+    data = r.get("data") if isinstance(r.get("data"), dict) else r
+    return {"available": True, "stats": data}
+
+
+def nm_capture_text(text, project=""):
+    """THE quick-capture path. The ⌘K command bar, the NexusMind app's terminal and
+    the Cases surface all land here, so there is one NexusMind client (nm_api), one
+    config and one `nexusmind_api` gate — this used to be a second, ungated client in
+    zenith_cases.py with its own base+token file. Returns the {"ok","key","detail"}
+    contract the command bar's localStorage queue depends on: ok:false parks the line
+    locally and shows `detail`, so `detail` must always be a displayable string."""
+    r = nm_ingest(text, source="zenith-cmdbar",
+                  hints={"project": project} if project else None)
+    if r.get("available") and r.get("key"):
+        return {"ok": True, "key": r.get("key") or "",
+                "detail": (r.get("classification") or {}).get("namespace") or ""}
+    return {"ok": False, "detail": r.get("error") or "capture failed"}
 
 
 # ---------------------------------------------------------------- stats
@@ -5006,6 +5133,13 @@ def tmux_ensure_session(session, cwd, argv, env, inline_env=None):
     # drag-select land only in tmux's private buffer — the yellow highlight vanishes on release and
     # nothing reaches the browser/OS clipboard. Idempotent server-global option.
     subprocess.run([TMUX_BIN, "set-option", "-g", "set-clipboard", "on"], capture_output=True)
+    # Scrub ZENITH_TERM_ID from the SERVER-global environment. A server started by an
+    # early spawn captured that spawn's term id, and every session created afterwards
+    # inherited it, so every statusline tagged its session against one wrong terminal.
+    # The id is inlined per command now, so the global is never wanted; unsetting it
+    # here heals a server that was already poisoned, without a tmux restart.
+    subprocess.run([TMUX_BIN, "set-environment", "-g", "-u", "ZENITH_TERM_ID"],
+                   capture_output=True)
     if not exists:
         subprocess.run([TMUX_BIN, "new-session", "-d", "-s", session, "-c", cwd],
                        env=env, capture_output=True, check=True)
@@ -5415,6 +5549,17 @@ def spawn_term(cwd, mode="shell", persist=True, resume_id=None, effort=None,
     # inline_env carries the vars that must be prefixed onto the tmux command
     # (a new tmux session inherits the server env, not this env dict).
     inline_env = {}
+    # ZENITH_TERM_ID must be INLINED, not just set in `env`. `env` belongs to the tmux
+    # CLIENT we exec; the pane is created by the already-running tmux SERVER and
+    # inherits the SERVER's environment. So whichever spawn happened to start that
+    # server stamped its own term id into the server global, and every session created
+    # afterwards inherited that same id — measured here as all 20+ live terminals
+    # reporting ZENITH_TERM_ID=b352654cac. The statusline keys the live session_id file
+    # by this variable, so every window wrote its ground truth into ONE other window's
+    # file: that file's session id changed on every render, every other terminal was
+    # left groundless, and the resolver fell back to guessing from the transcript pool.
+    # This is the root cause of "this window is showing another session".
+    inline_env["ZENITH_TERM_ID"] = term_id
     if effort in EFFORT_TOKENS and mode != "shell":
         env["MAX_THINKING_TOKENS"] = str(EFFORT_TOKENS[effort])
         inline_env["MAX_THINKING_TOKENS"] = str(EFFORT_TOKENS[effort])
@@ -5466,57 +5611,191 @@ def term_public(t):
                                   "created", "effort", "resume_id", "worktree")}
 
 
-def term_transcript(term_id):
-    """Best-effort transcript path for a live terminal, mirroring the Sessions
-    app's matching: an exact --resume id wins, else the newest transcript for
-    the terminal's cwd (a freshly-launched claude has no resume id yet)."""
-    with _terms_lock:
-        t = TERMS.get(term_id)
-        cwd, rid = (t.get("cwd"), t.get("resume_id")) if t else (None, None)
-        mode = (t or {}).get("mode") or ""
-        # every OTHER live terminal's claim, so the newest-in-cwd fallback cannot
-        # hand two terminals the same transcript
-        others = [(tid, o) for tid, o in TERMS.items() if tid != term_id]
-    claimed = set()
-    for tid, other in others:
-        for k in ("session_id", "resume_id"):
-            if other.get(k):
-                claimed.add(str(other[k]))
-        s = _live_session_id(tid, other.get('cwd'), other.get('resume_id'))
-        if s:
-            claimed.add(str(s))
-    if not cwd or not mode.startswith(("claude", "codex", "aider")):
-        return None                      # a plain shell drives no transcript
-    # 1. the id Claude itself reported for this terminal (written by the statusline
-    #    via ZENITH_TERM_ID) — exact, and the only thing that survives two sessions
-    #    started in the same project seconds apart
-    sid = _live_session_id(term_id, cwd, rid)
-    for want in (sid, rid):
-        if not want:
+def _transcript_scan():
+    """One pass over every project's transcripts -> ({session_id: path},
+    {project_dir_name: [paths]}). Built once per resolution instead of stat-ing a
+    candidate path per project per terminal."""
+    by_id, by_dir = {}, {}
+    if not TRANSCRIPTS_ROOT.exists():
+        return by_id, by_dir
+    for d in TRANSCRIPTS_ROOT.iterdir():
+        if not d.is_dir():
             continue
-        if want is rid and str(rid) in claimed:
-            break        # another terminal is actually RUNNING this session; a
-                         # spawn-time resume id does not outrank that
+        files = list(d.glob("*.jsonl"))
+        by_dir[d.name] = files
+        for f in files:
+            by_id.setdefault(f.stem, f)      # session ids are unique; first wins
+    return by_id, by_dir
 
-        for d in TRANSCRIPTS_ROOT.iterdir() if TRANSCRIPTS_ROOT.exists() else ():
-            p = d / (str(want) + ".jsonl")
-            if d.is_dir() and p.is_file():
-                return p
-    # 2. fallback: newest transcript for this cwd that no other terminal claims.
-    #    A fresh `claude` has no id until it writes one, so this covers the gap —
-    #    but it must not steal a transcript another window is already showing.
-    d = TRANSCRIPTS_ROOT / encode_path(cwd)
-    if not d.is_dir():
-        return None
-    files = []
-    for f in d.glob("*.jsonl"):
-        if f.stem in claimed:
+
+_ANCESTOR_CACHE = {}
+
+
+def _transcript_ancestor(path, _lines=60):
+    """The session this transcript was FORKED FROM, or None if it is a root.
+
+    Resuming (or compacting) a session does not continue its transcript: the CLI
+    freezes the old file and opens a new one under a new id. The new file records
+    where it came from in the snake_case `session_id` field — NOT `sessionId`,
+    which always names the file's own session — so the first `session_id` that
+    disagrees with the filename is the ancestor. Measured across every transcript
+    on this box: 9 of 84 are forks, and in all 9 the first such value named the
+    parent, including two forks off one ancestor and a two-step chain.
+
+    Cached forever by path: a transcript's opening records never change."""
+    key = str(path)
+    if key in _ANCESTOR_CACHE:
+        return _ANCESTOR_CACHE[key]
+    anc = None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _, line in zip(range(_lines), fh):
+                try:
+                    rec = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                sid = rec.get("session_id")
+                if not sid:
+                    continue
+                anc = None if str(sid) == path.stem else str(sid)
+                break                        # the first one that has it decides
+    except OSError:
+        pass
+    _ANCESTOR_CACHE[key] = anc
+    return anc
+
+
+def _forward_fork(p, by_dir, depth=6):
+    """Walk from a resume target to the transcript being written NOW.
+
+    A --resume id names the frozen ancestor — always, not sometimes. Left alone it
+    resolves to a dead file for the whole life of a resumed window, which is
+    exactly the "892 min ago while I am typing in it" report. Following the fork
+    edges forward lands on the live descendant instead. Newest wins where one
+    ancestor forked more than once; `depth` bounds a chain and any cycle a
+    malformed file could imply. Returns the input untouched when nothing forked
+    off it — a window that resumed a session and has not yet written its own
+    transcript must still resolve to the ancestor."""
+    cur, seen = p, {p}
+    for _ in range(depth):
+        kids = [f for f in by_dir.get(cur.parent.name, ())
+                if f not in seen and _transcript_ancestor(f) == cur.stem]
+        if not kids:
+            break
+        kids.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        cur = kids[0]
+        seen.add(cur)
+    return cur
+
+
+def _term_assignments(snap=None, scan=None):
+    """Resolve EVERY live terminal to a transcript at once, as {term_id: Path}.
+
+    `snap` / `scan` exist only so _selfcheck can drive this with a fixture; live
+    callers pass neither and get the real terminals and the real transcript tree.
+
+    Global on purpose, and the reason is the whole history of this function. The
+    invariant is "no two terminals may ever name the same transcript", and that
+    cannot be decided one request at a time: two terminals with no reported id are
+    indistinguishable in isolation, so each independently picked the newest file in
+    their shared project and both panes showed the same session.
+
+    It equally cannot be decided per BRANCH. The first fix ranked the terminals
+    that had no id at all and zipped them against the candidate files — but a
+    terminal holding a resume id whose session another window is actually running
+    breaks out of the exact-match step and lands in that same fallback, while being
+    filtered OUT of the ranking for having an id. Two terminals, two different
+    rival sets, both rank 0, same file again. Any scheme where one terminal's
+    answer depends on a guess about which branch another terminal took will keep
+    reproducing this.
+
+    So: three passes over one deterministic order, every pass claiming from a
+    shared `taken` set, and the invariant holds by construction no matter which
+    pass resolves a given terminal.
+      1. the id the session itself reported — statusline ground truth, then any
+         recorded session_id
+      2. a spawn-time --resume id
+      3. whatever is left in the terminal's own project, newest transcript to most
+         recently created terminal
+    A terminal with nothing left to claim gets None. "No transcript yet" is a true
+    statement; another session's prompts is not.
+    """
+    if snap is None:
+        with _terms_lock:
+            snap = [(tid, dict(o)) for tid, o in TERMS.items()]
+    by_id, by_dir = _transcript_scan() if scan is None else scan
+    # Newest terminal first. `created` is ISO-8601 so it sorts lexicographically;
+    # the id is a tie-break purely so two terminals spawned in the same microsecond
+    # still get a stable total order rather than one that flips between requests.
+    snap.sort(key=lambda x: (x[1].get("created") or "", x[0]), reverse=True)
+    live = [(tid, o) for tid, o in snap
+            if o.get("cwd")
+            and str(o.get("mode") or "").startswith(("claude", "codex", "aider"))]
+    out, taken = {}, set()
+
+    def claim(tid, want):
+        p = by_id.get(str(want)) if want else None
+        if p is None or p in taken:
+            return
+        out[tid] = p
+        taken.add(p)
+
+    grounded = set()
+    for tid, o in live:                      # 1. what the session reported
+        want = (_live_session_id(tid, o.get("cwd"), o.get("resume_id"))
+                or o.get("session_id"))
+        if want:
+            grounded.add(tid)                # we KNOW this one; never guess for it
+        claim(tid, want)
+    for tid, o in live:                      # 2. spawn-time --resume
+        if tid in out:
             continue
-        try:
-            files.append((f.stat().st_mtime, f))
-        except OSError:
-            pass
-    return max(files)[1] if files else None
+        anc = by_id.get(str(o.get("resume_id") or ""))
+        if anc is None:
+            continue
+        # Follow the fork chain: the spawn id names the frozen ancestor, and the
+        # session actually running is its newest descendant. If that descendant is
+        # already taken, the window running it claimed it in pass 1 and this
+        # terminal is not it — fall back to the ancestor, which at least names
+        # what this window was pointed at.
+        live_p = _forward_fork(anc, by_dir)
+        if live_p in taken:
+            live_p = anc
+        if live_p not in taken:
+            out[tid] = live_p
+            taken.add(live_p)
+    leftover = {}                            # 3. share out what remains, per project
+    for tid, o in live:
+        # A terminal that REPORTED its session id is excluded from the guess even when
+        # the claim failed. Failure there means the transcript does not exist yet (a
+        # session seconds old) or another window already holds it — in both cases we
+        # know which session this is and it is not one of the leftovers. Guessing
+        # anyway is how a brand-new terminal got handed a stranger's transcript:
+        # observed live, a terminal reporting 1cd60a51 was served bc7fd9d1 because its
+        # own file had not been written yet. "No transcript yet" is the true answer.
+        if tid not in out and tid not in grounded:
+            leftover.setdefault(o["cwd"], []).append(tid)
+    for cwd, tids in leftover.items():
+        files = []
+        for f in by_dir.get(encode_path(cwd), ()):
+            if f in taken:
+                continue
+            try:
+                files.append((f.stat().st_mtime, f))
+            except OSError:
+                pass
+        files.sort(key=lambda x: x[0], reverse=True)
+        for tid, (_, f) in zip(tids, files):  # both sides already newest-first
+            out[tid] = f
+            taken.add(f)
+    return out
+
+
+def term_transcript(term_id):
+    """Best-effort transcript for one live terminal: its slot in the global
+    assignment. A plain shell, or a terminal with nothing left to claim, gets
+    None — see _term_assignments for why this is resolved globally."""
+    return _term_assignments().get(term_id)
 
 
 def _live_session_id(term_id, cwd=None, rid=None):   # cwd/rid kept for callers
@@ -5559,6 +5838,323 @@ def prompts_payload(path=None, term=None):
         return {"prompts": [], "path": str(p), "detail": str(e)[:120]}
     return {"prompts": pr, "path": str(p), "id": p.stem, "count": len(pr),
             "truncated": len(pr) >= PROMPTS_MAX}
+
+
+# ------------------------------------------------------------- session-watch
+# A separate daemon (~/.claude/session-watch) tails every live transcript and
+# writes a prose read of each session — what it has been doing, what it is doing
+# right now — into its OWN sqlite db every 120s. ZENITH is a READER and nothing
+# else: the connection is opened mode=ro over a file: URI, so no amount of browser
+# traffic can take a write lock on the daemon's WAL or corrupt it.
+#
+# The db is optional ON PURPOSE. A box where the watcher was never started, or is
+# currently down, answers available:false — not a 500 — because the panel has to
+# render either way and "no watcher" is a normal state, not an error.
+
+def sw_connect():
+    if not SESSION_WATCH_DB.exists():
+        return None
+    return sqlite3.connect(f"file:{SESSION_WATCH_DB}?mode=ro", uri=True, timeout=2)
+
+
+def _sw_query(sql, args=()):
+    """Rows as dicts, or None when the watcher db is absent/unreadable — the
+    caller turns that None into available:false."""
+    con = sw_connect()
+    if con is None:
+        return None
+    con.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+
+
+def _sw_age_min(ts):
+    try:
+        return round((time.time() - float(ts)) / 60, 1) if ts else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _sw_json(raw, default):
+    try:
+        v = json.loads(raw or "")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return default
+    return v if isinstance(v, type(default)) else default
+
+
+def _sw_project_name(project, cwd, encmap):
+    """Readable name for a watcher row's mangled project dir.
+
+    match_project is the same resolver /api/sessions uses, so ordinary projects
+    display identically in both places. It misses ONLY claude's worktree dirs —
+    it expects `<enc>--worktrees…` while claude writes `<enc>--claude-worktrees…`,
+    because claude mangles the dot in `.claude` to a dash as well — so those fall
+    back to the row's real cwd, which names the project and the worktree leaf
+    without having to guess where the encoding put its separators."""
+    proj = match_project(project or "", encmap)
+    if proj:
+        return Path(proj).name
+    p = Path(cwd or "")
+    try:
+        rel = p.relative_to(PROJECTS_ROOT).parts
+    except ValueError:
+        rel = ()
+    if rel:
+        return rel[0] + (" · " + p.name if len(rel) > 1 else "")
+    return (project or "").rsplit("-claudeProjects-", 1)[-1] or None
+
+
+def session_watch_list(window=None):
+    """GET /api/session-watch — every session the watcher knows, newest transcript
+    write first, optionally only those touched in the last `window` minutes."""
+    rows = _sw_query("SELECT session_id, project, cwd, branch, mtime, state, prompts,"
+                     " errors, subagents, files_edited, tok_out, brief, now_line,"
+                     " summary_at FROM sessions ORDER BY mtime DESC")
+    if rows is None:
+        return {"available": False, "sessions": [], "count": 0,
+                "detail": "no session-watch db — the watcher is not running"}
+    encmap = project_encoding_map()
+    out = []
+    for r in rows:
+        age = _sw_age_min(r.get("mtime"))
+        if window is not None and (age is None or age > window):
+            continue
+        r["project_name"] = _sw_project_name(r.get("project"), r.get("cwd"), encmap)
+        r["age_min"] = age
+        r["summary_age_min"] = _sw_age_min(r.pop("summary_at"))
+        out.append(r)
+    return {"available": True, "sessions": out, "count": len(out)}
+
+
+SW_RECENT_N = 8          # narrative events returned with a session row
+SW_RECENT_SCAN = 300     # how far back to look to find that many
+
+# The watcher writes one event per tool call as well as one per prompt and per
+# assistant say. The tool-call lines are MECHANICS — `BASH sed -n …`, `READ /path` —
+# and answer "what did it type", not "what is going on". The prose lines are the
+# explanation: a decision offered, a thing fixed, a conclusion reached. Any command
+# meant for a HUMAN to run also lives inside prose, because a BASH event by
+# definition is one the agent already ran itself.
+#
+# So the trail keeps SAY and USER and drops the rest. The aggregate mechanics are
+# not lost — the Work section still counts every tool and names every file touched.
+SW_NARRATIVE_KINDS = ("SAY", "USER")
+_SW_EVENT_RE = re.compile(r"^\[(\d{1,2}:\d{2})\]\s*([A-Z][A-Z0-9_]*)\s*:?\s*(.*)$",
+                          re.S)
+
+
+def _sw_recent(sid):
+    """The last few NARRATIVE events for one session, newest first, as
+    [{seq, at, kind, text}].
+
+    Structured rather than raw lines because the client needs the parts
+    separately: `seq` addresses the event for a jump-to-transcript, `kind` picks
+    the styling, and `at` is a column of its own.
+
+    Scans SW_RECENT_SCAN rows to find SW_RECENT_N narrative ones — a busy session
+    can run dozens of tool calls between two sentences, so taking the last N rows
+    outright would return a trail made entirely of mechanics. Still one indexed
+    read: the table is keyed (session_id, seq).
+
+    Returns [] rather than None when the db is missing; the caller has already
+    answered available:true off the sessions row, so an empty trail is the honest
+    shape, not an error."""
+    rows = _sw_query("SELECT seq, line FROM events WHERE session_id = ?"
+                     " ORDER BY seq DESC LIMIT ?", (sid, SW_RECENT_SCAN))
+    out = []
+    for r in rows or []:
+        m = _SW_EVENT_RE.match((r["line"] or "").strip())
+        if not m or m.group(2) not in SW_NARRATIVE_KINDS:
+            continue
+        text = (m.group(3) or "").strip()
+        if not text:
+            continue
+        out.append({"seq": r["seq"], "at": m.group(1), "kind": m.group(2),
+                    "text": text})
+        if len(out) >= SW_RECENT_N:
+            break
+    return out
+
+
+def session_watch_session(session=None, path=None, term=None):
+    """GET /api/session-watch/session — one full row, addressed three ways.
+
+    `session` is the id (or any unique prefix of it); `path` and `term` resolve
+    exactly the way /api/prompts does — term_transcript() for a live terminal,
+    containment inside _transcript_roots() for a caller-supplied path. Both of
+    those collapse to the same key, because the watcher's session_id IS the
+    transcript filename stem."""
+    sid = (session or "").strip()
+    if not sid:
+        if term:
+            p = term_transcript(term)
+            if not p:
+                return {"available": False, "session_id": None,
+                        "detail": "no transcript yet for this terminal"}
+        else:
+            try:
+                p = Path(path or "").resolve()
+            except (OSError, ValueError):
+                return {"available": False, "session_id": None, "detail": "bad path"}
+            roots = _transcript_roots()
+            if not any(p == r or r in p.parents for r in roots) or not p.is_file():
+                return {"available": False, "session_id": None,
+                        "detail": "not a session transcript"}
+        sid = p.stem
+    rows = _sw_query("SELECT * FROM sessions WHERE session_id = ?", (sid,))
+    if rows is None:
+        return {"available": False, "session_id": sid,
+                "detail": "no session-watch db — the watcher is not running"}
+    # prefix form: the UI shows 8 chars of a uuid, so accept that as an address.
+    # Guarded on the uuid charset because '%' and '_' are LIKE wildcards and a
+    # session id can never legitimately contain either.
+    if not rows and re.fullmatch(r"[0-9a-fA-F-]{4,64}", sid):
+        rows = _sw_query("SELECT * FROM sessions WHERE session_id LIKE ?"
+                         " ORDER BY mtime DESC", (sid + "%",))
+    if not rows:
+        return {"available": False, "session_id": sid,
+                "detail": "the watcher has no record of this session yet"}
+    r = rows[0]
+    r["project_name"] = _sw_project_name(r.get("project"), r.get("cwd"),
+                                         project_encoding_map())
+    r["age_min"] = _sw_age_min(r.get("mtime"))
+    r["summary_age_min"] = _sw_age_min(r.get("summary_at"))
+    r["tools"] = _sw_json(r.get("tools_json"), [])
+    r["files"] = _sw_json(r.get("files_json"), [])
+    # Addressed by the RESOLVED id, not the caller's prefix: the events table keys on
+    # the full session_id, so a prefix lookup would silently return nothing.
+    r["recent"] = _sw_recent(r.get("session_id") or sid)
+    return dict(r, available=True)
+
+
+# ---- the watcher's config: read-only for the daemon, owned here ----------------
+# ZENITH is the daemon's READER for state.db and its WRITER for config.json, and
+# that is the whole coupling — no process management, no restart. The watcher
+# re-reads this file on every pass, so a successful POST applies within one
+# interval by itself.
+#
+# `api` is the shape of the HTTP call, not a vendor: ollama providers speak
+# /api/chat, everything else is treated as OpenAI-compatible (/v1). Mirrors the
+# same two-way split list_models() already makes.
+SW_CONFIG_DEFAULTS = {          # == session_watch.py DEFAULTS (portable local Ollama)
+    "enabled": True, "provider_id": "", "endpoint": "http://127.0.0.1:11434",
+    "api": "ollama", "api_key": "", "model": "qwen3:8b", "num_ctx": 8192,
+    "keep_alive": "30m", "interval": 120, "live_window": 60, "min_new": 8,
+    "brief_every": 40,
+}
+# field -> (min, max). num_ctx is load-bearing rather than cosmetic: uncapped,
+# Ollama reserves a KV cache for the model's full advertised context.
+SW_CONFIG_BOUNDS = {"num_ctx": (1024, 131072), "interval": (15, 3600),
+                    "live_window": (5, 1440), "min_new": (1, 500),
+                    "brief_every": (1, 1000)}
+
+
+def _sw_config_read():
+    """The file merged over the defaults, WITH the api_key. Internal only —
+    never hand this dict to a response; session_watch_config() is the public view."""
+    cfg = dict(SW_CONFIG_DEFAULTS)
+    on_disk = _load_json(SESSION_WATCH_CONFIG, {})
+    if isinstance(on_disk, dict):
+        cfg.update(on_disk)          # unknown keys (_comment) ride along untouched
+    return cfg
+
+
+def session_watch_config():
+    """GET /api/session-watch/config — the config MINUS the secret.
+
+    api_key never crosses to a browser; `has_key` is the only thing the UI needs
+    to know about it (and the UI never offers to set one — the key comes from the
+    chosen provider, server-side)."""
+    cfg = _sw_config_read()
+    prov = _provider(cfg.get("provider_id") or "")
+    return {"enabled": bool(cfg.get("enabled")),
+            "provider_id": cfg.get("provider_id") or "",
+            "provider_name": (prov or {}).get("name") or "",
+            "provider_missing": bool(cfg.get("provider_id")) and prov is None,
+            "model": cfg.get("model") or "",
+            "endpoint": cfg.get("endpoint") or "", "api": cfg.get("api") or "",
+            "has_key": bool(cfg.get("api_key")),
+            "keep_alive": cfg.get("keep_alive") or "30m",
+            "num_ctx": cfg["num_ctx"], "interval": cfg["interval"],
+            "live_window": cfg["live_window"], "min_new": cfg["min_new"],
+            "brief_every": cfg["brief_every"],
+            "exists": SESSION_WATCH_CONFIG.exists()}
+
+
+def _sw_config_int(body, key, out):
+    """One bounded whole number, or ValueError naming the field. Absent = keep."""
+    if key not in body or body[key] is None or body[key] == "":
+        return
+    lo, hi = SW_CONFIG_BOUNDS[key]
+    v = body[key]
+    try:
+        if isinstance(v, bool):
+            raise ValueError
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{key}: must be a whole number between {lo} and {hi}")
+    if not lo <= n <= hi:
+        raise ValueError(f"{key}: {n} is out of range — must be {lo}–{hi}")
+    out[key] = n
+
+
+def session_watch_config_save(body):
+    """POST /api/session-watch/config.
+
+    endpoint/api/api_key are DERIVED from provider_id here and are NOT accepted
+    from the client: taking them off the wire would let any browser point the
+    watcher at an arbitrary host, or plant a key. The client picks an id out of
+    data/providers.json and the server does the rest.
+
+    Raises ValueError (→ 400, naming the field) and leaves the file untouched."""
+    out = _sw_config_read()
+    enabled = bool(body.get("enabled", True))
+    pid = str(body.get("provider_id") or "").strip()
+    model = str(body.get("model") or "").strip()
+    if enabled and not pid:
+        raise ValueError("provider_id: required unless summaries are off")
+    if enabled and not model:
+        raise ValueError("model: required unless summaries are off")
+    if pid:
+        prov = _provider(pid)
+        if prov is None:
+            raise ValueError("provider_id: no provider with id " + pid)
+        # _provider_base, not base_url: a provider may list `fallbacks` so one entry
+        # reaches the same box on the LAN AND over Tailscale, and the watcher stores
+        # ONE endpoint — so it has to be a reachable one. Same resolver list_models
+        # uses, cached ~30s; single-endpoint providers skip the probe entirely.
+        out["endpoint"] = _provider_base(prov)
+        out["api"] = ("ollama" if str(prov.get("type") or "").strip().lower()
+                      == "ollama" else "openai")
+        out["api_key"] = str(prov.get("api_key") or "")
+    # provider "None": endpoint/api/api_key are left exactly as they were rather
+    # than blanked, so turning summaries back on is one dropdown, not a re-setup.
+    for key in SW_CONFIG_BOUNDS:
+        _sw_config_int(body, key, out)
+    out["enabled"] = enabled
+    out["provider_id"] = pid
+    out["model"] = model
+    _sw_config_write(out)
+    return dict(session_watch_config(), saved=True)
+
+
+def _sw_config_write(cfg):
+    """Atomic + 0600. Atomic because the watcher reads this file on a timer and
+    must never catch a half-written one; 0600 because it carries a provider's
+    api_key. The temp file is created 0600 too — a default-umask temp would be
+    world-readable for the instant before the rename."""
+    SESSION_WATCH_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SESSION_WATCH_CONFIG.with_name(SESSION_WATCH_CONFIG.name + ".tmp")
+    with os.fdopen(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                           0o600), "w") as f:
+        f.write(json.dumps(cfg, indent=2) + "\n")
+    os.replace(tmp, SESSION_WATCH_CONFIG)
+    os.chmod(SESSION_WATCH_CONFIG, 0o600)
 
 
 def kill_term(term_id):
@@ -6358,11 +6954,12 @@ def _nm_api_token():
     return ZENITH_NM_TOKEN_ENV or ""
 
 
-def nm_api(path, method="GET", body=None):
+def nm_api(path, method="GET", body=None, timeout=5):
     """Proxy an authed HTTP call to the NexusMind API (server-side). ZENITH can't
     touch the NM DB directly (loopback-only in docker) so it talks to NM's HTTP
     API at ZENITH_NM_API with a REQUIRED bearer token. Never throws — returns the
-    decoded JSON on success, or {"error": "..."} on any failure."""
+    decoded JSON on success, or {"error": "..."} on any failure. Always bounded:
+    the caps probe passes a shorter timeout than the data paths."""
     if _int_off("nexusmind_api"):             # off → no socket (§3.2)
         return {"error": "integration disabled"}
     token = _nm_api_token()
@@ -6376,7 +6973,7 @@ def nm_api(path, method="GET", body=None):
         headers["Content-Type"] = "application/json"
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        return json.loads(urllib.request.urlopen(req, timeout=5).read())
+        return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
     except urllib.error.HTTPError as e:
         detail = ""
         try:                       # surface NM's error body (e.g. 422 validator msg)
@@ -6704,43 +7301,19 @@ def whisper_transcribe(audio, filename):
 # bounded join so a call never exceeds the slowest single probe (~3.5s) and boot
 # never blocks (a warm-up thread primes them once, main()).
 
-_nm_api_cache = {"checked": 0.0, "ok": False, "detail": ""}   # ~30s, mirrors _pg_cache
-_nm_api_lock = threading.Lock()
-
 CAPS = {"generated": 0.0, "integrations": {}}   # capabilities-level TTL cache (§4.3)
 _caps_lock = threading.Lock()
 CAPS_TTL = 15.0
 CAPS_JOIN = 3.5                                  # parallel cold-probe join budget
 
 
-def _probe_nexusmind():
-    b = nm_backend()          # _pg_available (3s bound, 30s _pg_cache) then sqlite stat
-    return (b != "none"), (("backend: " + b) if b != "none" else "no backend")
-
-
 def _probe_nexusmind_api():
-    """token resolvable (_nm_api_token) AND GET {base}/api/watch/kinds == 200.
-    2s HTTP bound (shorter than nm_api's 5s), own ~30s cache."""
-    with _nm_api_lock:
-        now = time.time()
-        if now - _nm_api_cache["checked"] < 30:
-            return _nm_api_cache["ok"], _nm_api_cache["detail"]
-        tok = _nm_api_token()
-        ok, detail = False, "no token configured"
-        if tok:
-            detail = "api not reachable"
-            try:
-                req = urllib.request.Request(
-                    ZENITH_NM_API.rstrip("/") + "/api/watch/kinds",
-                    headers={"Authorization": "Bearer " + tok, "User-Agent": "zenith"})
-                with urllib.request.urlopen(req, timeout=2) as r:
-                    ok = r.status == 200
-                if ok:
-                    detail = "api reachable"
-            except Exception as e:            # noqa: BLE001 — probe never throws
-                detail = "api error: " + str(e)[:80]
-        _nm_api_cache.update(checked=now, ok=ok, detail=detail)
-        return ok, detail
+    """token resolvable AND the NexusMind API answers an authed read. This one
+    integration now gates BOTH surfaces that use that door (Memory, Watchers),
+    so it probes the API itself (/api/namespaces) rather than one blueprint —
+    a missing /api/watch/* must not hide a working memory module. 2.5s bound,
+    ~30s cache, token never echoed into the detail string (_nm_rest_ok)."""
+    return _nm_rest_ok()
 
 
 def _probe_homelab():
@@ -6762,7 +7335,6 @@ def _probe_fleet():
 
 
 _PROBES = {
-    "nexusmind": _probe_nexusmind,
     "nexusmind_api": _probe_nexusmind_api,
     "homelab": _probe_homelab,
     "voice": _probe_voice,
@@ -7159,13 +7731,33 @@ def main():
     # the zenith term id (from the env, or derived from the zenith-<id> tmux session name
     # so pre-existing sessions are retrofitted too). Best-effort, write-once per session.
     try:
-        tid = os.environ.get("ZENITH_TERM_ID")
-        if not tid and os.environ.get("TMUX"):
-            r = subprocess.run(["tmux", "display-message", "-p", "#{session_name}"],
-                               capture_output=True, text=True, timeout=1)
+        # tmux is the AUTHORITY here; the env var is only the non-tmux fallback. This
+        # order used to be reversed, and the env var is precisely the thing that cannot
+        # be trusted: a pane inherits ZENITH_TERM_ID from the tmux SERVER, so whichever
+        # spawn started that server stamps its own id onto every window opened
+        # afterwards. Measured: all 20+ live terminals reported ONE id, so every window
+        # wrote its session into one other window's file and every consumer downstream
+        # was left guessing. TMUX_PANE is genuinely per-pane and sessions are named
+        # zenith-<term id>, so asking tmux about THIS pane is exact.
+        #
+        # -t $TMUX_PANE matters: a bare display-message answers for the server's notion
+        # of the current client, which need not be the pane being rendered.
+        #
+        # And because the statusline is re-executed on every render, this RETROFITS
+        # windows whose claude process still carries the poisoned value: they correct
+        # themselves on their next render, with no restart.
+        tid = None
+        if os.environ.get("TMUX"):
+            pane = os.environ.get("TMUX_PANE")
+            r = subprocess.run(
+                ["tmux", "display-message", "-p"]
+                + (["-t", pane] if pane else []) + ["#{session_name}"],
+                capture_output=True, text=True, timeout=1)
             nm = r.stdout.strip()
             if nm.startswith("zenith-"):
                 tid = nm[len("zenith-"):]
+        if not tid:
+            tid = os.environ.get("ZENITH_TERM_ID")
         sid = data.get("session_id")
         if tid and sid:
             p = DATA_DIR / "live" / (tid + ".json")
@@ -8289,7 +8881,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "content": read_file_checked(q["path"])})
             if route == "/api/memory":
                 return self._json(nm_memories(q.get("q"), q.get("namespace"),
-                                              int(q.get("limit", 60))))
+                                              int(q.get("limit", 60)), q.get("tag")))
+            if route == "/api/memory/nmstats":
+                return self._json(nm_stats())
             if route == "/api/memory/meta":
                 return self._json(nm_meta())
             if route == "/api/memory/source":
@@ -8461,6 +9055,44 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(r, dict) or r.get("error") or r.get("status") == "error":
                     return self._json({"events": {"error": (r or {}).get("error", "events fetch failed")}})
                 return self._json({"events": r.get("events", [])})
+            # ---- Session-watch (external watcher db, opened read-only) ----
+            if route == "/api/session-watch":
+                return self._json(session_watch_list(
+                    float(q["window"]) if q.get("window") else None))
+            if route == "/api/session-watch/session":
+                if not (q.get("session") or q.get("path") or q.get("term")):
+                    return self._err("session, path or term required", 400)
+                return self._json(session_watch_session(
+                    q.get("session"), q.get("path"), q.get("term")))
+            if route == "/api/session-watch/config":
+                return self._json(session_watch_config())   # api_key never leaves
+            # ---- Cases (detectors over counted session facts) ----
+            if route == "/api/cases":
+                # N2: `state=all` is the explicit "every state" sentinel.
+                # A blank `state=` cannot express it: do_GET builds `q` with
+                # parse_qs's default keep_blank_values=False, so the blank
+                # value drops the key entirely and q.get("state","open")
+                # falls right back to "open". The command bar's `c<id> open`
+                # asked for the whole table that way, got only open cases,
+                # and then reported any snoozed/dismissed/resolved id as
+                # "no directory recorded on that case" — a false statement
+                # about a case that does have a cwd.
+                #
+                # Fixed here rather than by flipping keep_blank_values on
+                # that shared parse: `q` feeds EVERY GET route, and turning
+                # blanks into present-but-empty keys would change how each
+                # one tells "absent" from "empty" (e.g. the session-watch
+                # route's `session or path or term` required-arg check, which
+                # a blank would start satisfying). A sentinel on the one
+                # route that needs it cannot reach the others. 'all' is not a
+                # real case state, so it collides with nothing.
+                state = q.get("state", "open")
+                return self._json({"cases": zs.cases_query(
+                    state=(None if state == "all" else state),
+                    detector=q.get("detector"),
+                    project=q.get("project"), limit=int(q.get("limit", 100)))})
+            if route == "/api/cases/config":
+                return self._json(zc.load_config())
             if route.startswith("/api/"):
                 return self._err("unknown endpoint", 404)
             return self._static(route)
@@ -8492,6 +9124,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not r.get("available"):
                     return self._err(r.get("error", "no external statusline"), 404)
                 _cfg_evt("settings", "save", "statusline", "lk-statusline")
+                return self._json(r)
+            if url.path == "/api/session-watch/config":
+                # Config write on par with /api/statusline: NOT risk-gated. The
+                # response is the same api_key-free view the GET returns, and the
+                # event records only which provider was chosen, never its key.
+                r = session_watch_config_save(body)
+                _cfg_evt("settings", "save", "session-watch",
+                         r.get("provider_name") or "counted stats only")
                 return self._json(r)
             if url.path == "/api/config":
                 # Deep-merge patch → validate → persist → re-resolve globals →
@@ -8984,10 +9624,24 @@ class Handler(BaseHTTPRequestHandler):
                 r = agent_delete(body["name"])
                 _cfg_evt("agents", "delete", body["name"], body["name"])
                 return self._json(r)
+            # NexusMind terminal: ask / classifying ingest / correct. All proxied
+            # server-side through nm_api so the token never reaches the browser and
+            # the `nexusmind_api` switch gates them (same rule as /api/capture).
+            if url.path == "/api/memory/ask":
+                return self._json(nm_ask(body.get("question", ""),
+                                         body.get("namespace")))
+            if url.path == "/api/memory/ingest":
+                return self._json(nm_ingest(body.get("text", ""),
+                                            body.get("source") or "zenith-nm-terminal",
+                                            body.get("hints")))
+            if url.path == "/api/memory/correct":
+                return self._json(nm_correct(body.get("text", ""), body.get("key")))
             if url.path == "/api/memory/capture":
-                return self._json(nm_capture(
-                    body.get("title", ""), body.get("content", ""),
-                    body.get("tags", []), body.get("namespace", "default")))
+                r = nm_capture(body.get("title", ""), body.get("content", ""),
+                               body.get("tags", []), body.get("namespace", "default"))
+                if not r.get("queued"):        # real error → toast, not a false "captured"
+                    return self._err(r.get("error") or "capture failed", 502)
+                return self._json(r)
             if url.path == "/api/term":
                 try:
                     term_id = spawn_term(body.get("cwd"), body.get("mode", "shell"),
@@ -9030,6 +9684,60 @@ class Handler(BaseHTTPRequestHandler):
                     job["status"] = "stopped"
                     job["ended"] = now_iso()
                 return self._json({"ok": True})
+
+            # ---- Cases: snooze/dismiss/mute are DB-only writes scoped to one
+            # case (same class as the session-watch config write above) —
+            # deliberately NOT added to GATE_RULES. The frontend still calls
+            # them through jpost, so if a future slice does gate them the
+            # confirm modal appears with no frontend change. The one
+            # genuinely privileged verb Cases surfaces — kill — reaches the
+            # existing job.stop rule above, untouched.
+            if url.path == "/api/cases/act":
+                cid = int(body.get("id") or 0)
+                verb = str(body.get("verb") or "")
+                c = zs.case_by_id(cid)
+                if not c:
+                    return self._err("no such case", 404)
+                now = datetime.now(timezone.utc)
+                if verb == "snooze":
+                    mins = max(1, min(int(body.get("minutes") or 60), 10080))
+                    zs.case_update(cid, state="snoozed",
+                                   snooze_until=(now + timedelta(minutes=mins)).isoformat())
+                elif verb == "dismiss":
+                    zs.case_update(cid, state="dismissed", resolution="dismissed",
+                                   resolved_ts=now.isoformat())
+                elif verb == "mute":
+                    mins = max(1, min(int(body.get("minutes") or 60), 43200))
+                    cfg = zc.load_config()
+                    cfg.setdefault("mutes", []).append({
+                        "detector": c["detector"],
+                        "address": "%s/%s" % (c.get("project", ""),
+                                              c.get("workstream", "main")),
+                        "until": (now + timedelta(minutes=mins)).isoformat()})
+                    zc.save_config(cfg)
+                    zs.case_update(cid, state="dismissed", resolution="dismissed",
+                                   resolved_ts=now.isoformat())
+                else:
+                    return self._err("unknown verb: " + verb, 400)
+                zs.emit("case.action", project=c.get("project", ""), ref=str(cid),
+                        outcome=verb, actor="user", data={"detector": c["detector"]})
+                return self._json({"ok": True, "case": zs.case_by_id(cid)})
+
+            if url.path == "/api/cases/config":
+                zc.save_config(body)
+                _cfg_evt("settings", "save", "cases", "cases")
+                return self._json({"ok": True, "config": zc.load_config()})
+
+            if url.path == "/api/capture":
+                # Quick-capture to NexusMind. Proxied server-side ON PURPOSE: the
+                # NM token must never reach the browser, same rule as the
+                # session-watch api_key. nm_capture_text() is the ONE client —
+                # nm_api, one token source, gated by `nexusmind_api`.
+                text = str(body.get("text") or "").strip()
+                if not text:
+                    return self._err("text required", 400)
+                return self._json(nm_capture_text(text, body.get("project") or ""))
+
             return self._err("unknown endpoint", 404)
         except PermissionError as e:
             return self._err(e, 403)
@@ -9165,6 +9873,7 @@ def main():
     _reconstruct_workspace()      # rebuild the desktop's terminals if we booted after a reboot
     threading.Thread(target=loop_scheduler, daemon=True).start()
     threading.Thread(target=_telemetry_sweep, daemon=True).start()
+    threading.Thread(target=zc.sweep_loop, daemon=True).start()   # cases detectors
     threading.Thread(target=lambda: capabilities(refresh=True),   # warm probes once (§3.3)
                      daemon=True).start()                          # boot itself probes nothing
     server = ThreadingHTTPServer((BIND, PORT), Handler)
@@ -9509,13 +10218,30 @@ def _selfcheck():
     # off short-circuits at the API chokepoints BEFORE any probe/subprocess/socket.
     _saved = CONFIG
     try:
-        config_apply({"integrations": {"nexusmind": {"mode": "off"},
-                                       "nexusmind_api": {"mode": "off"},
+        config_apply({"integrations": {"nexusmind_api": {"mode": "off"},
                                        "voice": {"mode": "off"}}})
-        assert _int_off("nexusmind") and _nm_reachable() is False, \
-            "nexusmind off -> _nm_reachable False without invoking psql"
+        assert _int_off("nexusmind_api") and _nm_reachable() is False, \
+            "nexusmind_api off -> _nm_reachable False without opening a socket"
         assert nm_api("/api/watch/kinds").get("error") == "integration disabled", \
             "nexusmind_api off -> nm_api short-circuits (no socket)"
+        assert nm_memories()["available"] is False and nm_meta()["available"] is False \
+            and nm_meta()["namespaces"] == [] and nm_meta()["tags"] == [] \
+            and nm_source()["backend"] == "none" and "nodes" not in nm_graph() \
+            and "edges" not in nm_graph() \
+            and nm_timeline()["items"] == [] and nm_detail("k")["available"] is False \
+            and nm_capture("t", "", [], "x")["queued"] is False, \
+            "off -> every memory route degrades to the unavailable shape, no raise " \
+            "(nm_graph omits nodes/edges entirely rather than asserting an empty graph)"
+        # The NexusMind terminal's own routes sit behind the SAME switch — including the
+        # unified quick-capture, which used to be a second ungated client in zenith_cases.
+        assert nm_ask("q")["available"] is False and nm_ingest("t")["available"] is False \
+            and nm_correct("t")["available"] is False and nm_stats()["available"] is False \
+            and nm_memories(tag="idea")["available"] is False, \
+            "off -> ask/ingest/correct/stats/tag-list degrade to unavailable, no socket"
+        _cap = nm_capture_text("hello")
+        assert _cap["ok"] is False and isinstance(_cap.get("detail"), str) and _cap["detail"], \
+            "off -> /api/capture answers ok:false with a displayable detail (the command " \
+            "bar queues on ok:false and shows detail, so it must never be empty/None)"
         assert whisper_transcribe(b"", "x.webm").get("engine") == "browser", \
             "voice off -> whisper_transcribe returns browser-fallback shape"
         assert _int_mode("fleet") == "auto", "unset mode defaults to auto"
@@ -9714,6 +10440,75 @@ def _selfcheck():
     globals()["MODEL_MAP"] = _MODELS["aliases"]
     globals()["EFFORT_TOKENS"] = _MODELS["effort_tokens"]
     assert MODEL_MAP["sonnet"] == MODELS_FALLBACK["aliases"]["sonnet"]
+    # --- _term_assignments: no two terminals may name the same transcript -------
+    # This is a regression guard for the exact shape that broke twice: several
+    # claude terminals in ONE project, one of them holding a --resume id for a
+    # session another window is actually running. That one falls out of the
+    # exact-match step into the same fallback pool as its id-less neighbours, and
+    # every previous per-terminal or per-branch scheme then handed two of them the
+    # same file. Asserting the global invariant is the only thing that catches it.
+    with tempfile.TemporaryDirectory() as _td:
+        _cwd = "/x/proj"
+        _files = []
+        # dddd is a FORK of aaaa: its first session_id names its ancestor, which is
+        # how a resumed session is detectable at all (see _transcript_ancestor).
+        # Order matters — dddd is written BEFORE cccc so it is deliberately NOT the
+        # newest file. Otherwise a terminal that failed to follow the fork would be
+        # handed dddd by the recency fallback anyway, and the assertion below would
+        # pass while the logic it guards was gone (verified: it did).
+        # Files sit in a directory NAMED encode_path(cwd), exactly as they do under
+        # TRANSCRIPTS_ROOT — _forward_fork keys by the parent directory's name, so a
+        # fixture that parked them in a bare temp dir would silently never find a
+        # fork and would exercise the fallback instead of the code under test.
+        _dir = Path(_td) / encode_path(_cwd)
+        _dir.mkdir()
+        for _i, (_stem, _anc) in enumerate((("aaaa", "aaaa"), ("bbbb", "bbbb"),
+                                            ("dddd", "aaaa"), ("cccc", "cccc"))):
+            _f = _dir / (_stem + ".jsonl")
+            _f.write_text(json.dumps({"type": "user", "session_id": _anc}) + "\n")
+            os.utime(_f, (1000 + _i, 1000 + _i))          # cccc is the newest
+            _files.append(_f)
+        _scan = ({f.stem: f for f in _files}, {encode_path(_cwd): _files})
+        _iso = "2026-01-01T00:00:0"
+        _snap = [
+            ("t_run", {"cwd": _cwd, "mode": "claude", "created": _iso + "0",
+                       "session_id": "aaaa"}),            # really running aaaa
+            ("t_fork", {"cwd": _cwd, "mode": "claude", "created": _iso + "3",
+                        "resume_id": "aaaa"}),            # resumed; aaaa forked
+            ("t_plain", {"cwd": _cwd, "mode": "claude", "created": _iso + "5",
+                         "resume_id": "bbbb"}),           # resumed; never forked
+            ("t_new", {"cwd": _cwd, "mode": "claude", "created": _iso + "2"}),
+            ("t_old", {"cwd": _cwd, "mode": "claude", "created": _iso + "1"}),
+            ("t_starve", {"cwd": _cwd, "mode": "claude", "created": _iso + "0"}),
+            ("t_sh", {"cwd": _cwd, "mode": "shell", "created": _iso + "4"}),
+            # reports a session whose transcript does not exist yet (seconds old)
+            ("t_pending", {"cwd": _cwd, "mode": "claude", "created": _iso + "6",
+                           "session_id": "eeee"}),
+        ]
+        _a = _term_assignments(_snap, _scan)
+        assert len(set(_a.values())) == len(_a), ("two terminals share a "
+                                                  "transcript: %r" % (_a,))
+        assert "t_sh" not in _a, "a plain shell drives no transcript"
+        # Asserted early and by name: knowing which session a window runs but not yet
+        # having its file is NOT a licence to hand it somebody else's transcript. If
+        # this regresses, t_pending silently displaces a later terminal's claim and the
+        # first symptom downstream is a bare KeyError rather than the real reason.
+        assert "t_pending" not in _a, ("a terminal that reported its session id must "
+                                       "never be given a fallback transcript: %r" % (_a,))
+        assert _a["t_run"].stem == "aaaa", "reported id outranks a resume claim"
+        # The resume case that showed a 15-hour-old summary while the window was
+        # busy: aaaa is the FROZEN ancestor, dddd is where the session is actually
+        # being written, so the binding has to follow the fork forward.
+        assert _a["t_fork"].stem == "dddd", ("a resumed window must follow its "
+                                             "fork forward, not sit on the "
+                                             "frozen ancestor: %r" % (_a,))
+        # ...but only when a fork exists. Resumed-and-not-yet-written must still
+        # resolve to the ancestor rather than to None or to somebody else's file.
+        assert _a["t_plain"].stem == "bbbb", ("an unforked resume target must be "
+                                              "kept: %r" % (_a,))
+        assert _a["t_new"].stem == "cccc", _a
+        # nothing left to hand out: None beats another session's transcript
+        assert "t_old" not in _a and "t_starve" not in _a, "starved must get none"
     print("server self-check OK")
 
 

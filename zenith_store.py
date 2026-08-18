@@ -103,6 +103,49 @@ CREATE TABLE IF NOT EXISTS gates(
   event_id INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS cases(
+  id             INTEGER PRIMARY KEY,
+  opened_ts      TEXT NOT NULL,
+  updated_ts     TEXT NOT NULL,
+  detector       TEXT NOT NULL,
+  fingerprint    TEXT NOT NULL,
+  project        TEXT DEFAULT '',
+  workstream     TEXT DEFAULT '',
+  session_id     TEXT DEFAULT '',
+  severity       TEXT NOT NULL,
+  state          TEXT NOT NULL,
+  evidence       TEXT DEFAULT '{}',
+  fire_count     INTEGER NOT NULL DEFAULT 1,
+  snooze_until   TEXT DEFAULT '',
+  resolved_ts    TEXT DEFAULT '',
+  resolution     TEXT DEFAULT '',
+  resolution_ref TEXT DEFAULT '',
+  -- S4: the one notification a case is allowed is fired at ESCALATION, and
+  -- "already notified" has to survive a ZENITH restart or every open case
+  -- re-pushes on the next sweep. A dedicated column rather than reusing
+  -- resolution_ref/event_id: those have documented meanings and the next
+  -- caller would overwrite this by accident. Stamped once, never cleared.
+  notified_ts    TEXT DEFAULT '',
+  event_id       INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_case_live
+  ON cases(fingerprint) WHERE state IN ('open','snoozed');
+CREATE INDEX IF NOT EXISTS ix_case_state ON cases(state, id);
+
+CREATE TABLE IF NOT EXISTS case_samples(
+  id           INTEGER PRIMARY KEY,
+  ts           TEXT NOT NULL,
+  session      TEXT NOT NULL,
+  state        TEXT NOT NULL,
+  tok_out      INTEGER,
+  files_edited INTEGER,
+  errors       INTEGER,
+  events_seen  INTEGER,
+  mtime        REAL,
+  size         INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_case_sample ON case_samples(session, id);
+
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -167,10 +210,96 @@ def init_db(path):
                     pass       # fresh DB: _SCHEMA already created the column
             c.execute("CREATE INDEX IF NOT EXISTS ix_ev_agent ON events(agent, id)")
             c.execute("PRAGMA user_version=2")
-        # future migrations: if v < 3: ...
+        if v < 3:      # S4: cases.notified_ts (escalation-notified marker)
+            try:
+                c.execute("ALTER TABLE cases ADD COLUMN notified_ts TEXT DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass       # fresh DB: _SCHEMA already created the column
+            c.execute("PRAGMA user_version=3")
+        if v < 4:      # F1: cases.fingerprint re-keyed onto session_id
+            _migrate_case_fingerprints(c)
+            c.execute("PRAGMA user_version=4")
+        # future migrations: if v < 5: ...
         c.commit()
     finally:
         c.close()
+
+
+def _migrate_case_fingerprints(c):
+    """user_version<4 (F1): rewrite cases.fingerprint from the old
+    address-keyed form onto zenith_cases.fingerprint()'s new session-keyed
+    form, IN PLACE.
+
+    Why in place and not "let the sweep sort it out": the sweep reconciles
+    by fingerprint. Ship the new scheme without this and the very next pass
+    finds none of the 22 live cases' fingerprints, resolves every one of
+    them 'stale', opens 22 replacements with empty notified_ts, and pushes
+    a notification for each one already past escalation — i.e. it performs,
+    once and at full volume, the exact incident the new scheme exists to
+    prevent. Rewriting the rows first means the next sweep sees continuity:
+    same ids, same notified_ts, nothing resolved, nothing opened, nothing
+    pushed.
+
+    Mechanically it is one UPDATE that recomputes a pure function of two
+    columns the migration does not touch, which is what makes it safe:
+
+      * Idempotent three times over. It is gated by `v < 4` on a
+        user_version READ BEFORE ANY WRITE, so a completed run never
+        repeats. If it did repeat, `detector || '|' || session_id` is a
+        projection — applying it to its own output is the identity — and
+        the `fingerprint <> ...` guard means the second run matches zero
+        rows and writes nothing at all.
+      * It never INSERTs or DELETEs, and it is a plain UPDATE, not UPDATE
+        OR REPLACE / OR IGNORE: a uniqueness conflict RAISES instead of
+        silently deleting the row it collided with.
+      * It runs inside init_db()'s transaction, so a raise anywhere here
+        leaves user_version at 3 and every fingerprint untouched. Nothing
+        half-migrated is possible.
+
+    Rows with an EMPTY session_id are skipped, matching the fallback in
+    fingerprint(): they keep the address-keyed form, which is exactly what
+    that function will compute for them. Collapsing them onto 'detector|'
+    would let ux_case_live keep only one of them live at a time.
+
+    NON-LIVE rows are migrated too, deliberately. The dismiss cooldown (C2)
+    looks a dismissed case up BY FINGERPRINT
+    (case_by_fingerprint(include_dismissed_minutes=...)), so a dismissed row
+    left on the old scheme becomes unfindable under the new one: its
+    cooldown silently no-ops and the sweep reopens it as a brand-new case on
+    the very next pass — a quieter instance of the same bug. Resolved rows
+    have no behaviour attached to their fingerprint at all, but are migrated
+    for the same reason a table should not carry two incompatible ID
+    schemes: the next person to query case history by fingerprint would get
+    a silently partial answer. Uniqueness is not a concern for either, since
+    ux_case_live is partial (state IN ('open','snoozed')).
+
+    The one precondition is that no two LIVE cases share (detector,
+    session_id) — under the old scheme they could differ by project/
+    workstream and both be live, which is precisely how the incident's
+    id=23/id=26 pair arose (there the older one had already resolved, so
+    they did not collide). Verified 0 such pairs on the live DB. If it is
+    ever false the migration REFUSES rather than proceeding: SQLite would
+    raise IntegrityError on the UPDATE anyway, but with a message naming
+    neither the table's meaning nor the rows, and the operator's decision
+    (which of the duplicates keeps the case, and its notified_ts) is a
+    judgement call that must not be made by picking whichever row SQLite
+    happened to update second."""
+    dupes = c.execute(
+        "SELECT detector, session_id, COUNT(*), GROUP_CONCAT(id) FROM cases"
+        " WHERE state IN ('open','snoozed') AND COALESCE(session_id,'') <> ''"
+        " GROUP BY detector, session_id HAVING COUNT(*) > 1").fetchall()
+    if dupes:
+        raise RuntimeError(
+            "cases fingerprint migration (user_version 3->4) refused: %d "
+            "(detector, session_id) pair(s) already have more than one LIVE "
+            "case, so re-keying would violate ux_case_live. Resolve all but "
+            "one of each by hand (keep the row whose notified_ts you want to "
+            "honour), then restart: %s"
+            % (len(dupes), "; ".join("%s/%s -> case ids %s" % (d, s, ids)
+                                     for d, s, _n, ids in dupes)))
+    c.execute("UPDATE cases SET fingerprint = detector || '|' || session_id"
+              " WHERE COALESCE(session_id,'') <> ''"
+              "   AND fingerprint <> detector || '|' || session_id")
 
 
 def _import_loop_runs(c):
@@ -633,6 +762,273 @@ def gate_set_event(gid, event_id):
         c.close()
 
 
+# ---------------------------------------------------------------- cases
+
+_CASE_COLS = ("opened_ts", "updated_ts", "detector", "fingerprint", "project",
+              "workstream", "session_id", "severity", "state", "evidence",
+              "fire_count", "snooze_until", "resolved_ts", "resolution",
+              "resolution_ref", "notified_ts", "event_id")
+
+_SAMPLE_COLS = ("ts", "session", "state", "tok_out", "files_edited", "errors",
+                "events_seen", "mtime", "size")
+
+
+def _case_rows(rows):
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["evidence"] = json.loads(d.get("evidence") or "{}")
+        except (ValueError, TypeError):
+            d["evidence"] = {}
+        out.append(d)
+    return out
+
+
+def case_open(**cols):
+    """Insert one case. Raises sqlite3.IntegrityError if a live case already
+    holds this fingerprint — callers treat that as 'update the existing one'."""
+    now = _now_iso()
+    cols.setdefault("opened_ts", now)
+    cols.setdefault("updated_ts", now)
+    if not isinstance(cols.get("evidence"), str):
+        cols["evidence"] = json.dumps(cols.get("evidence") or {}, default=str)
+    keys = [k for k in _CASE_COLS if k in cols]
+    c = _conn()
+    try:
+        cur = c.execute(f"INSERT INTO cases({','.join(keys)})"
+                        f" VALUES({','.join('?' * len(keys))})",
+                        [cols[k] for k in keys])
+        c.commit()
+        return cur.lastrowid
+    finally:
+        c.close()
+
+
+def case_update(case_id, **cols):
+    """Update the named columns on one case.
+
+    An unknown column name RAISES rather than being silently dropped: because
+    updated_ts is set unconditionally the UPDATE always runs, so a typo'd
+    kwarg used to 'succeed' while applying none of what the caller asked for
+    — the same silent-wrongness class as an exclusion filter defaulting to
+    resolution='auto'. Fail loudly at the call site instead."""
+    unknown = sorted(set(cols) - set(_CASE_COLS))
+    if unknown:
+        raise ValueError("case_update: unknown column(s): %s" % ", ".join(unknown))
+    cols["updated_ts"] = _now_iso()
+    if "evidence" in cols and not isinstance(cols["evidence"], str):
+        cols["evidence"] = json.dumps(cols["evidence"] or {}, default=str)
+    keys = [k for k in _CASE_COLS if k in cols]
+    if not keys:
+        return
+    c = _conn()
+    try:
+        c.execute(f"UPDATE cases SET {','.join(k + '=?' for k in keys)} WHERE id=?",
+                  [cols[k] for k in keys] + [int(case_id)])
+        c.commit()
+    finally:
+        c.close()
+
+
+def case_by_id(case_id):
+    c = _conn()
+    try:
+        rows = _case_rows(c.execute("SELECT * FROM cases WHERE id=?", (int(case_id),)))
+    finally:
+        c.close()
+    return rows[0] if rows else None
+
+
+def case_by_fingerprint(fp, include_dismissed_minutes=0):
+    """The LIVE case for this fingerprint, or None. 'open'/'snoozed' always
+    count as live. A 'dismissed' case also counts as live for
+    `include_dismissed_minutes` after it was dismissed — dismissal is a
+    cooldown ('not right now'), not a permanent suppression, so the sweep
+    must not treat the fingerprint as free again immediately (C2) or the
+    very next pass reopens it as a brand-new case and re-fires `case.open`.
+    0 (the default) preserves the original open/snoozed-only contract for
+    every other caller.
+
+    The 'when was it dismissed' timestamp is COALESCE(resolved_ts,
+    updated_ts), not resolved_ts alone: the column defaults to '' (falsy in
+    Python but NOT NULL/absent to SQLite — `'' >= cutoff` is simply false,
+    same effective outcome as NULL), so a caller that dismisses a case
+    without explicitly setting resolved_ts would otherwise make the
+    cooldown silently no-op and reopen on the very next pass. updated_ts is
+    NOT NULL and always bumped by case_update() regardless of which columns
+    the caller passes, so it is a safe fallback signal for 'when did this
+    become dismissed' even if resolved_ts was never set."""
+    c = _conn()
+    try:
+        if include_dismissed_minutes and float(include_dismissed_minutes) > 0:
+            cutoff = (datetime.now(timezone.utc)
+                     - timedelta(minutes=float(include_dismissed_minutes))).isoformat()
+            rows = _case_rows(c.execute(
+                "SELECT * FROM cases WHERE fingerprint=? AND"
+                " (state IN ('open','snoozed')"
+                "  OR (state='dismissed' AND"
+                "      COALESCE(NULLIF(resolved_ts, ''), updated_ts) >= ?))"
+                " ORDER BY id DESC LIMIT 1", (str(fp), cutoff)))
+        else:
+            rows = _case_rows(c.execute(
+                "SELECT * FROM cases WHERE fingerprint=? AND state IN ('open','snoozed')"
+                " ORDER BY id DESC LIMIT 1", (str(fp),)))
+    finally:
+        c.close()
+    return rows[0] if rows else None
+
+
+def cases_query(state=None, detector=None, project=None, limit=100):
+    limit = max(1, min(int(limit or 100), 500))
+    where, args = [], []
+    if state:
+        where.append("state=?"); args.append(str(state))
+    if detector:
+        where.append("detector=?"); args.append(str(detector))
+    if project:
+        where.append("project=?"); args.append(str(project))
+    sql = "SELECT * FROM cases"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    c = _conn()
+    try:
+        return _case_rows(c.execute(sql, args))
+    finally:
+        c.close()
+
+
+def cases_resolve_cleared(state, live_fingerprints, resolution):
+    """Resolve, in one SQL statement, every case in `state` whose
+    fingerprint is NOT in live_fingerprints (I2). cases_query()'s 500-row
+    cap is fine for a UI page but is the wrong tool for reconciliation: past
+    500 open cases it silently strands the OLDEST ones — exactly the
+    stalest, most-overdue cases — forever. This resolves the full table
+    directly instead of paging through a capped SELECT.
+
+    `resolution` is REQUIRED and has no default, exactly like its inverse
+    sibling cases_resolve_matching(). It used to default to 'auto', which is
+    the one value an EXCLUSION filter must never hand out for free: 'auto'
+    means "the predicate was evaluated and came back false", and everything
+    this function selects is by definition everything nobody accounted for
+    — muted, disabled, crashed, quiet, session unknown to the watcher. That
+    default re-created a High-severity bug (cases auto-resolving that nobody
+    evaluated) that took two rounds to remove, for whichever caller came
+    next. The sweep passes 'stale'; a caller wanting 'auto' has
+    cases_resolve_matching() and must prove membership.
+    Returns the resolved rows as [{id, project, detector}, ...] so the
+    caller can emit one case.resolve event per row."""
+    fps = sorted(set(str(f) for f in (live_fingerprints or [])))
+    c = _conn()
+    try:
+        if fps:
+            placeholders = ",".join("?" * len(fps))
+            where = "state=? AND fingerprint NOT IN (%s)" % placeholders
+            args = [str(state)] + fps
+        else:
+            where = "state=?"
+            args = [str(state)]
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, project, detector FROM cases WHERE " + where, args)]
+        if rows:
+            now = _now_iso()
+            c.execute("UPDATE cases SET state='resolved', resolution=?,"
+                     " resolved_ts=?, updated_ts=? WHERE " + where,
+                     [str(resolution), now, now] + args)
+            c.commit()
+        return rows
+    finally:
+        c.close()
+
+
+def cases_resolve_matching(state, fingerprints, resolution):
+    """Resolve every case in `state` whose fingerprint IS in `fingerprints`
+    — the inverse filter of cases_resolve_cleared(), for when the caller
+    holds a specific, positively-evaluated set rather than "everything not
+    otherwise accounted for". The sweep uses this for 'auto': per I1, a
+    case may only resolve with resolution='auto' if its predicate was
+    ACTUALLY evaluated this pass and came back false — that positive
+    evidence has to be an explicit membership list, not an exclusion, or
+    every case nobody looked at this pass (disabled/muted/crashed/quiet/
+    unknown-session) would qualify by default.
+    Returns the resolved rows as [{id, project, detector}, ...]."""
+    fps = sorted(set(str(f) for f in (fingerprints or [])))
+    if not fps:
+        return []
+    c = _conn()
+    try:
+        placeholders = ",".join("?" * len(fps))
+        where = "state=? AND fingerprint IN (%s)" % placeholders
+        args = [str(state)] + fps
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, project, detector FROM cases WHERE " + where, args)]
+        if rows:
+            now = _now_iso()
+            c.execute("UPDATE cases SET state='resolved', resolution=?,"
+                     " resolved_ts=?, updated_ts=? WHERE " + where,
+                     [str(resolution), now, now] + args)
+            c.commit()
+        return rows
+    finally:
+        c.close()
+
+
+def cases_expire_snoozes(before_iso):
+    """Snoozed cases whose snooze_until has passed flip back to 'open' (I4)
+    — a snooze is a temporary hide, not a permanent one, and nothing else
+    ever un-snoozes on its own. Cases whose condition cleared while snoozed
+    are handled separately by cases_resolve_cleared(); this only un-hides
+    ones still live. Returns the number of rows flipped."""
+    c = _conn()
+    try:
+        cur = c.execute(
+            "UPDATE cases SET state='open', snooze_until='', updated_ts=?"
+            " WHERE state='snoozed' AND snooze_until != '' AND snooze_until <= ?",
+            (_now_iso(), str(before_iso)))
+        c.commit()
+        return cur.rowcount
+    finally:
+        c.close()
+
+
+def sample_insert(**cols):
+    cols.setdefault("ts", _now_iso())
+    keys = [k for k in _SAMPLE_COLS if k in cols]
+    c = _conn()
+    try:
+        cur = c.execute(f"INSERT INTO case_samples({','.join(keys)})"
+                        f" VALUES({','.join('?' * len(keys))})",
+                        [cols[k] for k in keys])
+        c.commit()
+        return cur.lastrowid
+    finally:
+        c.close()
+
+
+def samples_since(session, since_iso):
+    """Samples for one session at/after since_iso, oldest first."""
+    c = _conn()
+    try:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM case_samples WHERE session=? AND ts >= ? ORDER BY id",
+            (str(session), str(since_iso)))]
+    finally:
+        c.close()
+
+
+def samples_prune(before_iso):
+    """Drop samples older than before_iso. Returns the number removed."""
+    c = _conn()
+    try:
+        cur = c.execute("DELETE FROM case_samples WHERE ts < ?", (str(before_iso),))
+        c.commit()
+        return cur.rowcount
+    finally:
+        c.close()
+
+
 # ---------------------------------------------------------------- scorecard
 
 _PROBES = {
@@ -715,7 +1111,7 @@ def _selftest():
     init_db(dbp)
     init_db(dbp)
     c = sqlite3.connect(dbp)
-    assert c.execute("PRAGMA user_version").fetchone()[0] == 2, "user_version must be 2"
+    assert c.execute("PRAGMA user_version").fetchone()[0] == 4, "user_version must be 4"
     names = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"events", "verdicts", "session_snapshots", "primitive_scores",
             "gates", "meta"} <= names, f"missing tables: {names}"
@@ -906,8 +1302,67 @@ def _selftest():
     oc = sqlite3.connect(old)
     assert oc.execute("SELECT agent FROM events").fetchone()[0] == "claude", \
         "ALTER backfills 'claude' on legacy rows"
-    assert oc.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert oc.execute("PRAGMA user_version").fetchone()[0] == 4
     oc.close()
+
+    # F1: the v3->v4 fingerprint re-key, on a DB shaped like production's —
+    # old address-keyed fingerprints, a mix of states, one blank session_id.
+    fpdb = os.path.join(base, "fp3.db")
+    fc = sqlite3.connect(fpdb)
+    fc.executescript(_SCHEMA)
+    for cid, state, sid, fp in (
+            (1, "open",      "sA", "waiting_on_you|-home-user-zenith-src/main/sA"),
+            (2, "snoozed",   "sB", "silent_stall|proj/main/sB"),
+            (3, "dismissed", "sC", "waiting_on_you|proj/main/sC"),
+            (4, "resolved",  "sA", "waiting_on_you|old-name/main/sA"),
+            (5, "open",      "",   "silent_stall|proj/main/"),
+    ):
+        fc.execute("INSERT INTO cases(id,opened_ts,updated_ts,detector,fingerprint,"
+                   "session_id,severity,state,notified_ts) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (cid, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+                    fp.split("|")[0], fp, sid, "medium", state, "N%d" % cid))
+    fc.execute("PRAGMA user_version=3")
+    fc.commit(); fc.close()
+    init_db(fpdb)
+    fc = sqlite3.connect(fpdb)
+    assert fc.execute("PRAGMA user_version").fetchone()[0] == 4
+    got = dict(fc.execute("SELECT id, fingerprint FROM cases").fetchall())
+    assert got == {1: "waiting_on_you|sA", 2: "silent_stall|sB",
+                   3: "waiting_on_you|sC", 4: "waiting_on_you|sA",
+                   5: "silent_stall|proj/main/"}, f"fp migration: {got}"
+    # ids, states and notified_ts all survive untouched
+    rows = fc.execute("SELECT id,state,notified_ts FROM cases ORDER BY id").fetchall()
+    assert rows == [(1, "open", "N1"), (2, "snoozed", "N2"), (3, "dismissed", "N3"),
+                    (4, "resolved", "N4"), (5, "open", "N5")], f"fp migration churn: {rows}"
+    fc.close()
+    init_db(fpdb)                       # idempotent: no second rewrite, no raise
+    fc = sqlite3.connect(fpdb)
+    assert dict(fc.execute("SELECT id, fingerprint FROM cases").fetchall()) == got
+    fc.close()
+
+    # ...and it REFUSES (rather than letting SQLite drop a row) when two live
+    # cases already share (detector, session_id).
+    baddb = os.path.join(base, "fp3bad.db")
+    bc = sqlite3.connect(baddb)
+    bc.executescript(_SCHEMA)
+    for cid, fp in ((1, "waiting_on_you|old-name/main/sX"),
+                    (2, "waiting_on_you|new-name/main/sX")):
+        bc.execute("INSERT INTO cases(id,opened_ts,updated_ts,detector,fingerprint,"
+                   "session_id,severity,state) VALUES(?,?,?,?,?,?,?,?)",
+                   (cid, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+                    "waiting_on_you", fp, "sX", "medium", "open"))
+    bc.execute("PRAGMA user_version=3")
+    bc.commit(); bc.close()
+    try:
+        init_db(baddb)
+        raise AssertionError("colliding live cases must refuse to migrate")
+    except RuntimeError as e:
+        assert "1,2" in str(e), f"refusal must name the rows: {e}"
+    bc = sqlite3.connect(baddb)
+    assert bc.execute("SELECT COUNT(*) FROM cases").fetchone()[0] == 2, "no row dropped"
+    assert bc.execute("PRAGMA user_version").fetchone()[0] == 3, "left un-migrated"
+    bc.close()
+
     init_db(dbp)   # re-bind _DB to the main self-test store
 
     print("self-test OK")
